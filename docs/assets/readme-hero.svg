@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="432" viewBox="0 0 1200 432" fill="none" role="img" aria-labelledby="title description">
+  <title id="title">PutMeTo — your next role starts here</title>
+  <desc id="description">A local workspace for your CV, job discovery, tailored resumes, and application tracking.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1200" y2="432" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#132B2A"/>
+      <stop offset="1" stop-color="#0D191E"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="155" y2="200" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B8EDCA"/>
+      <stop offset="1" stop-color="#5EA899"/>
+    </linearGradient>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#C2E8D1" fill-opacity=".1"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="432" rx="24" fill="url(#background)"/>
+  <rect width="1200" height="432" rx="24" fill="url(#dots)"/>
+  <path d="M710 0V432M738 0V432" stroke="#9BE3BF" stroke-opacity=".06"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif">
+    <rect x="48" y="42" width="36" height="36" rx="11" fill="#B8EDCA"/>
+    <path d="M59 60L64 65L74 54" stroke="#173A30" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="96" y="68" fill="#ECF4ED" font-size="25" font-weight="700" letter-spacing="-.6">PutMeTo</text>
+    <text x="48" y="151" fill="#F5F7F0" font-size="57" font-weight="700" letter-spacing="-2">Your next role.</text>
+    <text x="48" y="213" fill="#B8EDCA" font-size="57" font-weight="700" letter-spacing="-2">Your own workspace.</text>
+    <text x="50" y="253" fill="#B8CCC6" font-size="19">Find opportunities. Prepare thoughtfully. Track every step.</text>
+    <rect x="50" y="279" width="108" height="27" rx="13.5" fill="#26413B"/>
+    <text x="67" y="297" fill="#CAE7D7" font-size="12" font-weight="600" letter-spacing="1">LOCAL APP</text>
+    <text x="174" y="298" fill="#9EB6AE" font-size="14">Your CV. Your AI. Your decisions.</text>
+    <circle cx="943" cy="164" r="111" stroke="#B8EDCA" stroke-opacity=".12"/>
+    <circle cx="943" cy="164" r="145" stroke="#B8EDCA" stroke-opacity=".06"/>
+    <g transform="translate(830 56) rotate(-9 75 100)">
+      <rect width="155" height="200" rx="13" fill="#24413F" stroke="#52766B"/>
+      <rect x="22" y="25" width="43" height="8" rx="4" fill="#7DA496"/>
+      <rect x="22" y="66" width="104" height="5" rx="2.5" fill="#52786B"/>
+      <rect x="22" y="84" width="88" height="5" rx="2.5" fill="#52786B"/>
+      <rect x="22" y="118" width="104" height="5" rx="2.5" fill="#52786B"/>
+      <rect x="22" y="136" width="68" height="5" rx="2.5" fill="#52786B"/>
+    </g>
+    <g transform="translate(924 88) rotate(8 75 100)">
+      <rect width="155" height="200" rx="13" fill="url(#accent)"/>
+      <path d="M24 39H62V66H24V39ZM35 39V32H51V39" stroke="#28594D" stroke-width="3" stroke-linejoin="round"/>
+      <rect x="24" y="89" width="104" height="7" rx="3.5" fill="#28594D"/>
+      <rect x="24" y="112" width="88" height="5" rx="2.5" fill="#579080"/>
+      <rect x="24" y="131" width="103" height="5" rx="2.5" fill="#579080"/>
+      <rect x="24" y="150" width="68" height="5" rx="2.5" fill="#579080"/>
+    </g>
+    <circle cx="1078" cy="97" r="28" fill="#EDCF92"/>
+    <path d="M1066 97L1074 105L1090 88" stroke="#4C482C" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M806 105V123M797 114H815" stroke="#A6DDBD" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="1093" cy="249" r="4" fill="#EDCF92"/>
+    <path d="M48 336H1152" stroke="#35504A"/>
+    <g font-size="16" font-weight="600">
+      <text x="50" y="382" fill="#A8DBC0">01</text><text x="82" y="382" fill="#DFEAE3">Build your profile</text>
+      <text x="321" y="382" fill="#A8DBC0">02</text><text x="353" y="382" fill="#DFEAE3">Discover jobs</text>
+      <text x="593" y="382" fill="#A8DBC0">03</text><text x="625" y="382" fill="#DFEAE3">Tailor your CV</text>
+      <text x="866" y="382" fill="#A8DBC0">04</text><text x="898" y="382" fill="#DFEAE3">Track progress</text>
+    </g>
+    <g stroke="#688D7D" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M276 377H287L283 373M287 377L283 381"/>
+      <path d="M548 377H559L555 373M559 377L555 381"/>
+      <path d="M820 377H831L827 373M831 377L827 381"/>
+    </g>
+  </g>
+</svg>

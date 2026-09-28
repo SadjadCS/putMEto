@@ -21,14 +21,14 @@ def client(tmp_path, monkeypatch):
 
 def candidate(name, *, support="supported", kind="technique", aliases=None):
     return ai.SkillCandidate(name=name, kind=kind, support=support,
-                             evidence="Fine-tuned Llama 2. Used SQL databases.",
+                             evidence="Orchestrated scheduled data pipelines using Apache Airflow. Used SQL databases.",
                              rationale="Grounded technique." if support == "supported" else "An adjacent option. Confirm actual knowledge first.",
                              aliases=aliases or [])
 
 
 def background():
     return {"id": "experience", "kind": "experience", "title": "Engineer", "organization": "Example", "start": "2020", "end": "2022",
-            "original": "Fine-tuned Llama 2. Used SQL databases.", "enhanced": "Fine-tuned Llama 2. Used SQL databases.", "confirmed": True}
+            "original": "Orchestrated scheduled data pipelines using Apache Airflow. Used SQL databases.", "enhanced": "Orchestrated scheduled data pipelines using Apache Airflow. Used SQL databases.", "confirmed": True}
 
 
 def docx():
@@ -90,7 +90,7 @@ def test_related_database_does_not_match_or_enter_resume_until_confirmed(client,
         "id": "job", "title": "Engineer", "description": "Work with Postgres", "url": "https://example.com/jobs/1", "status": "saved",
     }]))
     async def suggest(*args):
-        return [candidate("LLM fine-tuning"), candidate("PostgreSQL", kind="database", support="related", aliases=["Postgres"])]
+        return [candidate("Workflow orchestration"), candidate("PostgreSQL", kind="database", support="related", aliases=["Postgres"])]
     monkeypatch.setattr(ai, "suggest_skills", suggest)
     response = client.post("/api/suggestions/skills")
     assert response.status_code == 200
@@ -144,7 +144,7 @@ def test_stale_skill_suggestions_are_not_saved(client, monkeypatch):
     db.mutate_state(lambda state: state.update(items=[background()]))
     async def suggest(*args):
         db.mutate_state(lambda state: state["items"][0].update(confirmed=False))
-        return [candidate("LLM fine-tuning")]
+        return [candidate("Workflow orchestration")]
     monkeypatch.setattr(ai, "suggest_skills", suggest)
     assert client.post("/api/suggestions/skills").status_code == 409
     assert db.get_state()["skills"] == []

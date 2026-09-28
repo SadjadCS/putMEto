@@ -29,18 +29,18 @@ def smoke(artifacts: Path | None = None) -> None:
     workspace["settings"].pop("api_key", None)
     workspace["settings"]["api_key_set"] = False
     workspace["items"] = [{
-        "id": "existing-experience", "kind": "experience", "title": "Research engineer",
-        "organization": "Fixture University", "original": "Fine-tuned Llama 2 with QLoRA.",
-        "enhanced": "Fine-tuned Llama 2 with QLoRA.", "confirmed": True,
+        "id": "existing-experience", "kind": "experience", "title": "Data engineer",
+        "organization": "Fixture Company", "original": "Orchestrated scheduled data pipelines using Apache Airflow.",
+        "enhanced": "Orchestrated scheduled data pipelines using Apache Airflow.", "confirmed": True,
     }]
     workspace["skills"] = [
         {"id": "legacy-python", "name": "Python", "confirmed": True},
         {"id": "legacy-r", "name": "R", "confirmed": False},
-        {"id": "fine", "name": "Fine-tuning", "kind": "technique", "support": "supported", "origin": "resume",
-         "confirmed": False, "evidence": "Fine-tuned Llama 2 with QLoRA.",
-         "rationale": "A reusable modeling technique demonstrated in your project.", "aliases": ["LLM fine-tuning"]},
-        {"id": "llama", "name": "Llama 2", "kind": "tool", "support": "supported", "origin": "resume",
-         "confirmed": False, "evidence": "Fine-tuned Llama 2 with QLoRA."},
+        {"id": "workflow", "name": "Workflow orchestration", "kind": "technique", "support": "supported", "origin": "resume",
+         "confirmed": False, "evidence": "Orchestrated scheduled data pipelines using Apache Airflow.",
+         "rationale": "A reusable data engineering technique demonstrated in your project.", "aliases": ["Workflow-orchestration"]},
+        {"id": "airflow", "name": "Apache Airflow", "kind": "tool", "support": "supported", "origin": "resume",
+         "confirmed": False, "evidence": "Orchestrated scheduled data pipelines using Apache Airflow."},
         {"id": "sql", "name": "SQL querying", "kind": "technique", "support": "related", "origin": "suggestion",
          "confirmed": False, "rationale": "Review this option if you have queried relational data."},
         {"id": "postgres", "name": "PostgreSQL", "kind": "database", "support": "related", "origin": "suggestion",
@@ -48,10 +48,10 @@ def smoke(artifacts: Path | None = None) -> None:
         {"id": "vectors", "name": "Vector databases", "kind": "database", "support": "related", "origin": "suggestion",
          "confirmed": False, "rationale": '<img src=x onerror="window.bad=true"> Review your actual experience.'},
     ]
-    workspace["jobs"] = [{"id": "fixture-job", "title": "ML engineer", "company": "Fixture Company",
+    workspace["jobs"] = [{"id": "fixture-job", "title": "Data engineer", "company": "Fixture Company",
                            "location": "Europe", "status": "saved", "match_score": 0,
-                           "description": "Work on retrieval and fine-tuning.", "source": "Fixture",
-                           "url": "https://example.com/jobs/ml"}]
+                           "description": "Work on data pipelines and workflow orchestration.", "source": "Fixture",
+                           "url": "https://example.com/jobs/data"}]
     original_items = deepcopy(workspace["items"])
     writes, imports, suggestions, errors = [], [], [], []
     pending_imports = []
@@ -86,9 +86,9 @@ def smoke(artifacts: Path | None = None) -> None:
                 if job_attempts == 1:
                     route.fulfill(status=503, json={"detail": "Skills suggestions are temporarily unavailable. Retry shortly."})
                     return
-                workspace["skills"].append({"id": "rag", "name": "Retrieval-augmented generation",
+                workspace["skills"].append({"id": "data-quality", "name": "Data quality checks",
                                              "kind": "technique", "support": "related", "origin": "suggestion",
-                                             "confirmed": False, "rationale": "Relevant to the saved ML engineer opportunity."})
+                                             "confirmed": False, "rationale": "Relevant to the saved Data engineer opportunity."})
             route.fulfill(json={"count": 1, "message": "Skill suggestions are ready for review."})
         elif path.startswith("/api/"):
             errors.append(f"Unexpected API request: {request.method} {path}")
@@ -120,23 +120,23 @@ def smoke(artifacts: Path | None = None) -> None:
             page.goto(origin + "/#profile")
             expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("Python")
             expect(skills.locator('[data-skill-group="review"]')).to_contain_text("R")
-            expect(card("fine")).to_contain_text("Technique")
-            expect(card("fine")).to_contain_text("Listed in your CV")
-            expect(card("fine")).to_contain_text("Fine-tuned Llama 2 with QLoRA.")
-            expect(card("fine")).to_contain_text("LLM fine-tuning")
-            expect(card("llama")).to_contain_text("Tool")
+            expect(card("workflow")).to_contain_text("Technique")
+            expect(card("workflow")).to_contain_text("Listed in your CV")
+            expect(card("workflow")).to_contain_text("Orchestrated scheduled data pipelines using Apache Airflow.")
+            expect(card("workflow")).to_contain_text("Workflow-orchestration")
+            expect(card("airflow")).to_contain_text("Tool")
             expect(card("postgres")).to_contain_text("Database")
             expect(card("vectors")).to_contain_text("Explore and confirm")
             assert skills.locator("img").count() == 0
             assert page.evaluate("window.bad") is None
 
-            page.get_by_role("checkbox", name="Confirm Fine-tuning", exact=True).check()
-            expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("Fine-tuning")
-            saved = next(item for item in writes[-1]["items"] if item["id"] == "fine")
-            assert saved["confirmed"] is True and saved["evidence"] == "Fine-tuned Llama 2 with QLoRA."
-            assert saved["aliases"] == ["LLM fine-tuning"]
-            page.get_by_role("checkbox", name="Confirm Fine-tuning", exact=True).uncheck()
-            expect(skills.locator('[data-skill-group="supported"]')).to_contain_text("Fine-tuning")
+            page.get_by_role("checkbox", name="Confirm Workflow orchestration", exact=True).check()
+            expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("Workflow orchestration")
+            saved = next(item for item in writes[-1]["items"] if item["id"] == "workflow")
+            assert saved["confirmed"] is True and saved["evidence"] == "Orchestrated scheduled data pipelines using Apache Airflow."
+            assert saved["aliases"] == ["Workflow-orchestration"]
+            page.get_by_role("checkbox", name="Confirm Workflow orchestration", exact=True).uncheck()
+            expect(skills.locator('[data-skill-group="supported"]')).to_contain_text("Workflow orchestration")
             page.get_by_role("checkbox", name="Confirm PostgreSQL", exact=True).check()
             expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("PostgreSQL")
             assert next(item for item in writes[-1]["items"] if item["id"] == "postgres")["support"] == "related"
@@ -189,7 +189,7 @@ def smoke(artifacts: Path | None = None) -> None:
             expect(page.locator("#job-skills-status")).to_contain_text("Retry shortly")
             page.get_by_role("button", name="Suggest relevant skills", exact=True).click()
             expect(page.locator("#modal")).not_to_be_visible()
-            expect(card("rag")).to_contain_text("Relevant to the saved ML engineer opportunity")
+            expect(card("data-quality")).to_contain_text("Relevant to the saved Data engineer opportunity")
             assert suggestions[-1] == {"job_id": "fixture-job"}
             assert page.url.endswith("#profile?skills")
 

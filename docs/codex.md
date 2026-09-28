@@ -26,4 +26,4 @@ The `codex_chat` SQLite state entry stores the runtime thread ID and latest 200 
 
 Tests: `python -m pytest tests/test_codex.py -q` runs without a ChatGPT account or network calls. Live inference additionally needs a supported ChatGPT account, internet access, and a host environment where Codex can use its normal account/state storage.
 
-`python tests/browser_codex_smoke.py` exercises the UI against mocked API responses using Playwright and installed Chrome on macOS. It covers sign-in, streaming updates, questions/approvals, cancellation, provider switching, draft preservation, safe text rendering, and mobile layout. Live checks also verified managed ChatGPT authentication, structured connection responses, CV extraction and chat tool dispatch with synthetic data, conversation resumption in a new runtime, and the running application's Assistant/Settings pages.
+`python tests/browser_codex_smoke.py` exercises the UI against mocked API responses using Playwright and installed Chrome on macOS. It covers sign-in, streaming updates, questions/approvals, cancellation, provider switching, draft preservation, safe text rendering, and mobile layout.

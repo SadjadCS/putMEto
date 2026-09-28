@@ -51,7 +51,7 @@ def test_import_and_backfill_preserve_skills_absent_from_experience(monkeypatch)
 def test_suggestions_include_resume_skills_without_promoting_old_candidates(monkeypatch):
     state = {
         "items": [
-            {"id": "confirmed", "confirmed": True, "original": "Fine-tuned Llama 2.", "enhanced": "Fine-tuned Llama 2."},
+            {"id": "confirmed", "confirmed": True, "original": "Orchestrated scheduled data pipelines using Apache Airflow.", "enhanced": "Orchestrated scheduled data pipelines using Apache Airflow."},
             {"id": "draft", "confirmed": False, "original": "Unverified Kubernetes draft."},
         ],
         "skills": [
@@ -68,7 +68,7 @@ def test_suggestions_include_resume_skills_without_promoting_old_candidates(monk
     async def generate(settings, instructions, data, output_type):
         observed.update(data=data, instructions=instructions, output_type=output_type)
         return output_type.model_validate({"skills": [
-            skill("LLM fine-tuning", kind="technique", evidence="Fine-tuned Llama 2."),
+            skill("Workflow orchestration", kind="technique", evidence="Orchestrated scheduled data pipelines using Apache Airflow."),
             skill("PostgreSQL", kind="database", support="related", evidence="SQL"),
         ]})
 
@@ -82,7 +82,7 @@ def test_suggestions_include_resume_skills_without_promoting_old_candidates(monk
     assert all("Qdrant" not in str(data[key]) for key in ("resume_skills", "confirmed_skills", "confirmed_items"))
     assert "settings" not in data
     assert data["job_context_for_relevance_only"]["description"] == "The employer requires Oracle."
-    assert [(item.name, item.support) for item in result] == [("LLM fine-tuning", "supported"), ("PostgreSQL", "related")]
+    assert [(item.name, item.support) for item in result] == [("Workflow orchestration", "supported"), ("PostgreSQL", "related")]
     assert all(not hasattr(item, "confirmed") for item in result)
     assert state == original
 
