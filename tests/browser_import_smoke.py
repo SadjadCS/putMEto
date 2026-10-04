@@ -1,4 +1,4 @@
-"""Offline browser regression check for CV upload failures and retries.
+"""Offline browser regression check for CV import acceptance, failures, and retries.
 
 Run: .venv/bin/python tests/browser_import_smoke.py
 Optional: --artifacts artifacts/import-browser
@@ -34,6 +34,7 @@ def smoke(artifacts: Path | None = None) -> None:
     workspace["settings"]["api_key_set"] = False
     pending_imports = []
     import_requests = []
+    master_status = {"state": "idle", "message": "", "model": "", "effort": "", "started_at": "", "running": False, "has_cv": False, "built": None}
     errors = []
     origin = "http://putmeto.test"
     if artifacts:
@@ -47,6 +48,15 @@ def smoke(artifacts: Path | None = None) -> None:
             route.abort()
         elif path == "/api/state":
             route.fulfill(json=workspace)
+        elif path == "/api/job-matching":
+            route.fulfill(json={"state": "idle", "message": "", "done": 0, "total": 0, "model": "", "effort": "", "running": False, "waiting": 0})
+        elif path == "/api/goldmove":
+            route.fulfill(json={"state": "idle", "message": "", "done": 0, "total": 0, "running": False, "waiting": 0,
+                                "eligible": 0, "checked": 0, "dismissed": 0, "candidates": []})
+        elif path == "/api/skill-groups":
+            route.fulfill(json={"state": "idle", "message": "", "model": "", "effort": "", "running": False, "waiting": 0})
+        elif path == "/api/master-resume":
+            route.fulfill(json=master_status)
         elif path == "/api/import" and request.method == "POST":
             import_requests.append(request)
             # Deliberately hold the response so progress and disabled controls
@@ -113,11 +123,12 @@ def smoke(artifacts: Path | None = None) -> None:
         try:
             page.goto(origin + "/#profile")
             page.get_by_role("button", name="Import your CV", exact=True).click()
+            expect(page.locator("#modal")).to_contain_text("All extracted information is accepted by default")
 
             choose("resume.doc", b"Synthetic legacy Word fixture", "application/msword")
             submit.click()
-            assert_inline_error("Save as .docx or PDF")
-            assert not import_requests, "Legacy Word files reached the import API."
+            assert_inline_error("save or download it as a PDF")
+            assert not import_requests, "Word files reached the import API."
 
             choose("resume.exe", b"Synthetic unsupported file", "application/octet-stream")
             submit.click()
@@ -146,40 +157,64 @@ def smoke(artifacts: Path | None = None) -> None:
             assert_inline_error("AI extraction is temporarily unavailable. Please try again.")
             assert len(import_requests) == 2
 
-            choose("resume.txt", b"Fixture Applicant\nResearch assistant\nMaintained sample records.", "text/plain")
+            choose("resume.pdf", b"%PDF-1.4\nSynthetic fixture only")
             begin_import()
             workspace["profile"]["name"] = "Fixture Applicant"
             workspace["items"] = [{
                 "id": "fixture-experience", "kind": "experience", "title": "Research assistant",
                 "organization": "Fixture University", "start": "2024", "end": "2025",
                 "original": "Maintained sample records.", "enhanced": "Maintained research sample records.",
-                "confirmed": False,
+                "confirmed": True,
             }]
-            finish_import(200, {"count": 1, "message": "Imported one experience for review."})
+            workspace["skills"] = [{"id": "fixture-skill", "name": "Data management", "confirmed": True, "origin": "resume", "support": "supported"}]
+            master_status.update(state="working", running=True, has_cv=True, model="gpt-6-astra", effort="ultra",
+                                 message="Building your master resume with gpt-6-astra at ultra reasoning. This can take several minutes; you can keep working.")
+            finish_import(200, {"count": 1, "skill_count": 1, "master_resume": True, "message": "CV imported and confirmed. You can edit your profile anytime."})
             expect(page.locator("#modal")).not_to_be_visible()
             expect(page.locator("#profile-form [name=name]")).to_have_value("Fixture Applicant")
             expect(page.locator(".item-card")).to_contain_text("Research assistant")
-            expect(page.locator(".item-card")).to_contain_text("Needs review")
+            panel = page.locator("#master-resume")
+            expect(panel).to_contain_text("Building your master resume")
+            expect(panel).to_contain_text("gpt-6-astra at ultra reasoning")
+            expect(panel.get_by_role("button")).to_have_count(0)
+            # When the build finishes, the page shows it and reloads the organized entries by itself.
+            workspace["items"][0].update(original="Maintained sample records for the master resume.", enhanced="", source="cv")
+            master_status.update(state="done", running=False, message="Your master resume is ready.",
+                                 built={"built_at": "2026-09-30T14:05:00+00:00", "model": "gpt-6-astra", "effort": "ultra"})
+            expect(panel).to_contain_text("Built from your CV on", timeout=15000)
+            expect(panel).to_contain_text("with gpt-6-astra at ultra reasoning, in your own words.")
+            expect(panel.get_by_role("button", name="Rebuild", exact=True)).to_be_visible()
+            expect(page.locator(".item-card")).to_contain_text("Maintained sample records for the master resume.")
+            expect(page.locator(".item-card")).to_contain_text("Confirmed")
+            expect(page.locator(".item-card")).to_contain_text("Ready to include in your resume")
+            expect(page.get_by_role("button", name="Review & confirm", exact=True)).to_have_count(0)
+            expect(page.locator('[data-skill-id="fixture-skill"]')).to_contain_text("Data management")
+            expect(page.locator("#technical-skills [data-skill-group]")).to_have_count(0)
+            expect(page.locator("#technical-skills")).not_to_contain_text("Listed in your CV")
+            expect(page.get_by_role("checkbox", name="Confirm Data management", exact=True)).to_be_checked()
+            page.get_by_role("button", name="Edit", exact=True).click()
+            expect(page.locator("#item-form [name=original]")).to_have_value("Maintained sample records for the master resume.")
+            page.locator('#modal [data-action="close-modal"]').click()
             assert len(import_requests) == 3
 
-            # A modern Word CV is accepted in the ordinary full-import flow,
-            # including uppercase extensions and generic browser MIME types.
+            # Word CVs are rejected before upload with guidance to save them as PDF.
             page.get_by_role("button", name="Import your CV", exact=True).click()
             document = BytesIO()
             with ZipFile(document, "w") as archive:
                 archive.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Synthetic Word CV</w:t></w:r></w:p></w:body></w:document>')
             choose("RESUME.DOCX", document.getvalue(), "application/octet-stream")
-            begin_import()
-            assert b'filename="RESUME.DOCX"' in import_requests[-1].post_data_buffer
-            workspace["items"].append({"id": "word-experience", "kind": "experience", "title": "Word CV experience", "organization": "Fixture University", "original": "Imported from Word.", "confirmed": False})
-            finish_import(200, {"count": 1, "message": "Imported a Word CV for review."})
-            expect(page.locator("#modal")).not_to_be_visible()
-            expect(page.locator(".item-card").filter(has_text="Word CV experience")).to_have_count(1)
-            assert len(import_requests) == 4
+            submit.click()
+            assert_inline_error("save or download it as a PDF")
+            choose("resume.txt", b"Fixture Applicant\nResearch assistant", "text/plain")
+            submit.click()
+            assert_inline_error("save or download it as a PDF")
+            assert len(import_requests) == 3, "Only PDFs reach the import API."
+            expect(picker).to_have_attribute("accept", ".pdf,application/pdf")
+            page.locator('#modal [data-action="close-modal"]').click()
 
             page.set_viewport_size({"width": 390, "height": 844})
             page.get_by_role("button", name="Import your CV", exact=True).click()
-            choose("resume.txt", b"Synthetic mobile fixture", "text/plain")
+            choose("resume.pdf", b"%PDF-1.4\nSynthetic mobile fixture")
             begin_import()
             finish_import(415, {"detail": failure})
             assert_inline_error(failure)
@@ -194,7 +229,7 @@ def smoke(artifacts: Path | None = None) -> None:
             raise
         finally:
             browser.close()
-    print("CV import browser checks passed: file validation, DOCX acceptance, legacy DOC guidance, visible inline errors, progress, retry, successful profile refresh, and mobile layout.")
+    print("CV import browser checks passed: PDF-only file validation with guidance for Word and text files, visible inline errors, progress, retry, automatic confirmation, optional editing, successful profile refresh, master resume progress and completion, and mobile layout.")
 
 
 if __name__ == "__main__":

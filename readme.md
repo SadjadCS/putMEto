@@ -27,18 +27,19 @@ Your workspace and browser automation run locally. With local Ollama, CV process
 
 | | What you can do |
 | --- | --- |
-| **📄 Your CV, ready to work** | Import PDF, Word `.docx`, or text. Review extracted experience and skills, then approve wording that represents you. |
+| **📄 Your CV, ready to work** | Import your CV as a PDF. The AI reads each page, your own wording is kept, and extracted information is accepted automatically; edit anything whenever you want. |
 | **🔎 A search shaped around you** | Choose target roles, locations, and sources. Discover opportunities through LinkedIn, Remotive, Greenhouse, Lever, and supported careers pages. |
 | **✨ A resume for each opportunity** | Prepare tailored resumes from confirmed experience and skills. Preview, print, or download a PDF. |
 | **📊 Application tracking & progress reports** | See saved jobs, tailored resumes, in-progress applications, and confirmed submissions in dashboard summaries. |
 | **🤖 A workspace for your agents** | Use the built-in Codex assistant, or connect your own agent through the Python client and local API. Build custom search, filtering, and summary workflows. |
+| **🚀 Apply automatically** | Let a browser agent submit applications for jobs that match your master CV at 70% or more, using only your data. It stops to ask you rather than guess. |
 | **🏡 Automation on your computer** | Run the app, database, and assisted browser locally. Review suggested content and application forms before submitting. |
 
 ## From your CV to your next application
 
-**Import → Review → Discover → Tailor → Apply → Track**
+**Import → Edit if needed → Discover → Tailor → Apply → Track**
 
-1. **Bring your experience.** Import your CV and confirm your profile, experience, and skills.
+1. **Bring your experience.** Import your CV. Your profile, experience, and skills are accepted automatically; edit them anytime.
 2. **Set your direction.** Choose roles, locations, and job sources.
 3. **Find your shortlist.** Discover jobs and save opportunities worth pursuing.
 4. **Prepare your application.** Generate a tailored resume and review it.
@@ -78,7 +79,9 @@ python run.py
 
 </details>
 
-Open **[localhost:8000](http://127.0.0.1:8000)**, choose an AI provider in **Settings**, and import your CV. Keep the terminal running; press **Ctrl+C** to stop.
+On macOS or Linux you can also run it in the background: `./putmeto.sh start`, and later `./putmeto.sh stop`, `restart`, `status`, or `logs`. Stopping works like Ctrl+C, so the LinkedIn browser closes cleanly and keeps your sign-in; the log is `data/putmeto.log`.
+
+Open **[localhost:8000](http://127.0.0.1:8000)**. New workspaces use the local Codex CLI by default; open **Assistant** to check your ChatGPT sign-in, then import your CV. You can choose another AI provider in **Settings**. Keep the terminal running; press **Ctrl+C** to stop.
 
 No Node.js installation, frontend build, or hosted database is needed.
 
@@ -146,6 +149,16 @@ python -m camoufox fetch
 Restart PutMeTo. Sign in to LinkedIn in the visible browser when prompted; its session is stored in your local workspace.
 
 Searches return bounded batches. Browser assistance fills recognized fields and can attach your prepared resume; you review and submit. Site availability, verification, and rate limits still apply. [Browser setup](docs/user-guide.md#optional-camoufox-browser) · [LinkedIn search](docs/user-guide.md#search-linkedin)
+
+## Optional auto-apply
+
+Let [browser-use](https://github.com/browser-use/browser-use) fill in and submit applications in Chrome, driven by Codex through your ChatGPT sign-in:
+
+```bash
+python -m pip install -r requirements-apply.txt
+```
+
+Restart PutMeTo, fill in **Your answers for applications** on the Applications page, sign in to LinkedIn in the application browser, and select **Start**. [How auto-apply works](docs/user-guide.md#apply-automatically)
 
 ## Your data, on your computer
 

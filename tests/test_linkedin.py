@@ -1,6 +1,7 @@
 """Offline coverage for LinkedIn search, review boundaries, and saved jobs."""
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -161,6 +162,7 @@ def browser_session(monkeypatch):
     monkeypatch.setattr(linkedin, "_get_session", AsyncMock(return_value=session))
     monkeypatch.setattr(linkedin, "validate_public_url", AsyncMock(side_effect=lambda url: url))
     monkeypatch.setattr(linkedin, "_search_lock", asyncio.Lock())
+    monkeypatch.setattr(linkedin, "SEARCH_GAP", (0.0, 0.0))
     monkeypatch.setattr(linkedin, "_extract_cards", AsyncMock(return_value=[linkedin.normalize_job({**RAW_JOB, "description": ""})]))
     monkeypatch.setattr(linkedin, "_extract_detail", AsyncMock(return_value=linkedin.normalize_job(RAW_JOB)))
     return session
@@ -177,6 +179,75 @@ def test_browser_search_reads_real_cards_and_details_and_respects_limit(browser_
     assert result["requires_action"] is False
     assert browser_session["page"].goto.await_count == 2
     linkedin._extract_detail.assert_awaited_once()
+
+
+def test_every_linkedin_page_load_waits_a_random_human_scale_gap(monkeypatch):
+    clock, sleeps = [1000.0], []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(linkedin.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(linkedin.asyncio, "sleep", sleep)
+    monkeypatch.setattr(linkedin, "_last_navigation", 0.0)
+
+    async def browse():
+        await linkedin._pause((4.0, 9.0))  # The first load has nothing to wait for.
+        clock[0] += 1.5  # Reading the page took a moment.
+        await linkedin._pause((4.0, 9.0))
+
+    asyncio.run(browse())
+    assert len(sleeps) == 1 and 2.5 <= sleeps[0] <= 7.5
+    assert len(linkedin.navigations) == 2
+
+
+def test_page_load_limits_survive_a_restart(monkeypatch):
+    now = time.time()
+    (db.DATA_DIR / linkedin.PACE_FILE).write_text(json.dumps([now - 90_000, now - 7200, now - 60]))
+    assert list(linkedin.recent_navigations()) == [now - 7200, now - 60], "Loads older than a day are dropped."
+    asyncio.run(linkedin._pause((0.0, 0.0)))
+    saved = json.loads((db.DATA_DIR / linkedin.PACE_FILE).read_text())
+    assert len(saved) == 3 and saved[:2] == [now - 7200, now - 60]
+
+
+def test_search_url_pages_through_results():
+    assert "start=50" in linkedin.build_search_url("AI Engineer", "Europe", start=50)
+    assert "start" not in linkedin.build_search_url("AI Engineer", "Europe")
+
+
+def test_direct_search_paces_the_results_page_and_each_job_page(browser_session, monkeypatch):
+    gaps = []
+
+    async def pause(gap):
+        gaps.append(gap)
+
+    monkeypatch.setattr(linkedin, "_pause", pause)
+    monkeypatch.setattr(linkedin, "_page_snapshot", AsyncMock(side_effect=[
+        {"url": SEARCH_URL, "status": 200, "has_jobs": True},
+        {"url": RAW_JOB["url"], "status": 200, "has_jobs": False},
+    ]))
+    asyncio.run(linkedin.search_linkedin("Python", limit=1))
+    assert gaps == [linkedin.SEARCH_GAP, linkedin.SEARCH_GAP]
+
+
+def test_direct_search_waits_for_a_background_page_instead_of_failing(browser_session, monkeypatch):
+    monkeypatch.setattr(linkedin, "_page_snapshot", AsyncMock(side_effect=[
+        {"url": SEARCH_URL, "status": 200, "has_jobs": True},
+        {"url": RAW_JOB["url"], "status": 200, "has_jobs": False},
+    ]))
+
+    async def exercise():
+        await linkedin._search_lock.acquire()
+        monkeypatch.setattr(linkedin, "_background_step", True)
+        search = asyncio.create_task(linkedin.search_linkedin("Python", limit=1))
+        await asyncio.sleep(0)
+        assert not search.done()
+        monkeypatch.setattr(linkedin, "_background_step", False)
+        linkedin._search_lock.release()
+        return await search
+
+    assert asyncio.run(exercise())["jobs"][0]["description"] == RAW_JOB["description"]
 
 
 def test_pending_security_challenge_keeps_window_without_new_navigation(browser_session, monkeypatch):
@@ -243,6 +314,106 @@ def test_linkedin_launch_uses_private_persistent_workspace_profile(tmp_path, mon
     assert profile.is_dir()
     assert profile.stat().st_mode & 0o777 == 0o700
     context.route.assert_awaited_once()
+
+
+def test_linkedin_browser_keeps_one_device_identity_across_launches():
+    pytest.importorskip("camoufox.fingerprints")
+    first = linkedin._browser_identity()
+    assert first["preset"]["navigator"] and first["config"]["fonts"] and first["config"]["canvas:seed"]
+    saved = db.DATA_DIR / linkedin.IDENTITY_FILE
+    assert saved.stat().st_mode & 0o777 == 0o600
+    assert linkedin._browser_identity() == first, "A restart reuses the saved identity instead of inventing a new device."
+    from camoufox.utils import launch_options
+
+    def resolved():
+        identity = linkedin._browser_identity()
+        env = launch_options(headless=True, fingerprint_preset=identity["preset"], config=dict(identity["config"]))["env"]
+        return "".join(env[key] for key in sorted((key for key in env if key.startswith("CAMOU_CONFIG_")), key=lambda key: int(key.rsplit("_", 1)[1])))
+
+    assert resolved() == resolved()
+
+
+class CookieJar:
+    """The part of a browser context that holds cookies."""
+
+    def __init__(self, cookies):
+        self.jar, self.added = list(cookies), []
+
+    async def cookies(self, urls=None):
+        return list(self.jar)
+
+    async def add_cookies(self, cookies):
+        self.added.extend(cookies)
+        self.jar.extend(cookies)
+
+
+SIGNED_IN = [
+    {"name": "li_at", "value": "synthetic-token", "domain": ".www.linkedin.com", "path": "/", "expires": time.time() + 86_400 * 300,
+     "httpOnly": True, "secure": True, "sameSite": "None"},
+    {"name": "JSESSIONID", "value": "synthetic-ajax", "domain": ".www.linkedin.com", "path": "/", "expires": -1,
+     "httpOnly": False, "secure": True, "sameSite": "None"},
+]
+
+
+def test_sign_in_is_backed_up_privately_and_restored_when_the_profile_loses_it():
+    asyncio.run(linkedin._remember_sign_in(CookieJar(SIGNED_IN)))
+    saved = db.DATA_DIR / linkedin.SESSION_FILE
+    assert saved.stat().st_mode & 0o777 == 0o600
+    asyncio.run(linkedin._remember_sign_in(CookieJar([{"name": "bcookie", "value": "guest", "domain": ".linkedin.com", "path": "/", "expires": -1}])))
+    assert [cookie["name"] for cookie in json.loads(saved.read_text())] == ["li_at", "JSESSIONID"], "Guest pages never replace a saved sign-in."
+
+    signed_out = CookieJar([{"name": "bcookie", "value": "kept", "domain": ".linkedin.com", "path": "/", "expires": -1}])
+    assert asyncio.run(linkedin._restore_sign_in(signed_out)) is True
+    assert [cookie["name"] for cookie in signed_out.added] == ["li_at", "JSESSIONID"]
+    assert "expires" not in signed_out.added[1], "A session cookie is added back without an expiry."
+    still_signed_in = CookieJar(SIGNED_IN)
+    assert asyncio.run(linkedin._restore_sign_in(still_signed_in)) is False and not still_signed_in.added
+
+
+def test_expired_or_refused_sign_in_is_never_restored():
+    saved = db.DATA_DIR / linkedin.SESSION_FILE
+    saved.write_text(json.dumps([{**SIGNED_IN[0], "expires": time.time() - 10}]))
+    assert asyncio.run(linkedin._restore_sign_in(CookieJar([]))) is False
+    saved.write_text(json.dumps(SIGNED_IN))
+    session = {"restored_sign_in": True}
+    linkedin._forget_sign_in(session)
+    assert not saved.exists() and session["restored_sign_in"] is False
+    assert asyncio.run(linkedin._restore_sign_in(CookieJar([]))) is False
+
+
+def test_login_page_after_a_restore_drops_the_saved_copy(browser_session, monkeypatch):
+    saved = db.DATA_DIR / linkedin.SESSION_FILE
+    saved.write_text(json.dumps(SIGNED_IN))
+    browser_session["restored_sign_in"] = True
+    monkeypatch.setattr(linkedin, "_page_snapshot", AsyncMock(return_value={"url": "https://www.linkedin.com/login", "has_login_form": True}))
+    result = asyncio.run(linkedin.search_linkedin("Python"))
+    assert result["requires_action"] is True
+    assert not saved.exists(), "A restored sign-in LinkedIn refused is not retried."
+
+
+def test_launching_the_browser_restores_a_lost_sign_in(monkeypatch):
+    (db.DATA_DIR / linkedin.SESSION_FILE).write_text(json.dumps(SIGNED_IN))
+    jar = CookieJar([])
+    page = SimpleNamespace(is_closed=lambda: False, set_default_timeout=lambda value: None, on=lambda *args: None)
+    context = SimpleNamespace(pages=[page], on=lambda *args: None, cookies=jar.cookies, add_cookies=jar.add_cookies)
+    browser = SimpleNamespace(is_connected=lambda: True, on=lambda *args: None)
+    monkeypatch.setattr(linkedin, "_session", None)
+    monkeypatch.setattr(linkedin, "_launch", AsyncMock(return_value=(SimpleNamespace(), browser, context)))
+    session = asyncio.run(linkedin._get_session())
+    assert session["restored_sign_in"] is True
+    assert [cookie["name"] for cookie in jar.added] == ["li_at", "JSESSIONID"]
+
+
+def test_identity_skips_presets_camoufox_cannot_build(monkeypatch):
+    fingerprints = pytest.importorskip("camoufox.fingerprints")
+    real = fingerprints.get_random_preset
+    broken = {**real(os="macos"), "webgl": {"unmaskedVendor": "No Such Vendor", "unmaskedRenderer": "No Such GPU"}}
+    offered = iter([broken])
+    monkeypatch.setattr(fingerprints, "get_random_preset", lambda **kwargs: next(offered, None) or real(**kwargs))
+    identity = linkedin._browser_identity()
+    assert identity["preset"] != broken and linkedin._usable(identity)
+    (db.DATA_DIR / linkedin.IDENTITY_FILE).write_text(json.dumps({**identity, "preset": broken}))
+    assert linkedin._browser_identity()["preset"] != broken, "A saved identity that stopped working is replaced, not reused."
 
 
 def test_closing_linkedin_session_retains_persistent_profile(tmp_path, monkeypatch):
@@ -480,28 +651,78 @@ def test_removed_linkedin_source_stays_removed_after_initial_upgrade(workspace):
     assert all(source["kind"] != "linkedin" for source in workspace.get("/api/state").json()["sources"])
 
 
-@pytest.mark.parametrize("positions", [[], [{"id": "reviewed", "name": "Software Engineer", "confirmed": True}]])
-def test_linkedin_discovery_ignores_role_and_location_preferences(workspace, monkeypatch, positions):
+def unrelated_job(number, title="Cashier"):
+    return {**RAW_JOB, "title": title, "description": "Serve customers at the register.", "location": "Chula Vista, CA",
+            "remote": False, "url": f"https://www.linkedin.com/jobs/view/{number}/"}
+
+
+def test_linkedin_discovery_searches_target_positions_and_skips_unrelated_jobs(workspace, monkeypatch):
     db.mutate_state(lambda state: state.update(
-        positions=positions,
+        positions=[{"id": "ai", "name": "Senior AI Engineer", "confirmed": True},
+                   {"id": "llm", "name": "LLM Engineer (Agents)", "confirmed": True},
+                   {"id": "draft", "name": "Cashier", "confirmed": False}],
         skills=[{"id": "python", "name": "Python", "confirmed": True}],
-        preferences={"track": "industry", "location": "Boston", "remote_only": True},
+        preferences={"track": "industry", "location": "", "remote_only": True},
         sources=[{"id": "linkedin", "name": "LinkedIn", "kind": "linkedin", "url": "https://www.linkedin.com/jobs/search/", "enabled": True}],
     ))
-    job = {**RAW_JOB, "title": "Office administrator", "location": "Paris, France", "description": "Manage office supplies and visitor reception.", "remote": False}
-    search = AsyncMock(return_value=search_result(job))
+    relevant = {**RAW_JOB, "title": "AI Engineer", "url": "https://www.linkedin.com/jobs/view/9000000002/"}
+    search = AsyncMock(return_value=search_result(relevant, unrelated_job(9000000003), unrelated_job(9000000004, "Production Supervisor")))
     monkeypatch.setattr(jobs, "search_linkedin", search)
     response = workspace.post("/api/jobs/discover")
     assert response.status_code == 200, response.text
     assert response.json()["count"] == 1
+    assert "Skipped 4 that do not match your target positions" in response.json()["message"]
+    query = "(Senior AI Engineer) OR (LLM Engineer Agents)"
     assert search.await_args_list == [
-        call("", location="United States", remote_only=False, limit=10),
-        call("", location="Europe", remote_only=False, limit=10),
+        call(query, location="United States", remote_only=True, limit=10),
+        call(query, location="Europe", remote_only=True, limit=10),
     ]
-    stored = db.get_state()["jobs"][0]
-    assert stored["source"] == "LinkedIn"
-    assert stored["title"] == "Office administrator"
-    assert stored["matched_skills"] == []
+    assert [job["title"] for job in db.get_state()["jobs"]] == ["AI Engineer"]
+
+
+def test_linkedin_discovery_searches_the_preferred_location_and_needs_target_positions(workspace, monkeypatch):
+    db.mutate_state(lambda state: state.update(
+        positions=[{"id": "p", "name": "Data Engineer", "confirmed": False}],
+        preferences={"track": "industry", "location": "Berlin, Germany", "remote_only": False},
+        sources=[{"id": "linkedin", "name": "LinkedIn", "kind": "linkedin", "url": "https://www.linkedin.com/jobs/search/", "enabled": True}],
+    ))
+    search = AsyncMock(return_value=search_result())
+    monkeypatch.setattr(jobs, "search_linkedin", search)
+    response = workspace.post("/api/jobs/discover")
+    assert response.status_code == 422
+    assert "Search LinkedIn" in response.json()["detail"]
+    assert not search.await_args_list
+    db.mutate_state(lambda state: state["positions"][0].update(confirmed=True))
+    assert workspace.post("/api/jobs/discover").status_code == 200
+    assert search.await_args_list == [call("Data Engineer", location="Berlin, Germany", remote_only=False, limit=10)]
+
+
+def test_positions_query_fits_linkedins_keyword_limit():
+    positions = [f"Senior Applied Machine Learning Engineer {index}" for index in range(12)]
+    query = jobs.positions_query(positions)
+    assert len(query) <= 300
+    assert query.startswith("(Senior Applied Machine Learning Engineer 0) OR (Senior Applied Machine Learning Engineer 1)")
+    assert jobs.positions_query([]) == ""
+
+
+def test_explicit_search_keeps_searched_or_target_roles_and_skips_padding(workspace, monkeypatch):
+    db.mutate_state(lambda state: state.update(positions=[{"id": "p", "name": "Software Engineer", "confirmed": True}]))
+    results = [RAW_JOB, unrelated_job(9000000005), {**unrelated_job(9000000006), "title": "Head Cashier"}]
+    monkeypatch.setattr(jobs, "search_linkedin", AsyncMock(return_value=search_result(*results)))
+
+    blank = workspace.post("/api/linkedin/search", json={"regions": ["United States"]}).json()
+    assert [job["title"] for job in blank["jobs"]] == ["Python Software Engineer"]
+    assert blank["skipped"] == 2 and "Skipped 2 results" in blank["message"]
+
+    searched = workspace.post("/api/linkedin/search", json={"keywords": "cashier", "regions": ["United States"]}).json()
+    assert sorted(job["title"] for job in searched["jobs"]) == ["Cashier", "Head Cashier", "Python Software Engineer"]
+    assert searched["skipped"] == 0
+
+
+def test_search_without_keywords_or_target_positions_browses_everything(workspace, monkeypatch):
+    monkeypatch.setattr(jobs, "search_linkedin", AsyncMock(return_value=search_result(RAW_JOB, unrelated_job(9000000007))))
+    response = workspace.post("/api/linkedin/search", json={"regions": ["United States"]}).json()
+    assert response["count"] == 2 and response["skipped"] == 0
 
 
 @pytest.mark.parametrize("payload", [{}, {"keywords": ""}, {"keywords": "   "}])

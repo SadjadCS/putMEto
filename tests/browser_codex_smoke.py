@@ -49,6 +49,10 @@ def route_request(route):
         state['settings'].update(payload)
         body = {'message': 'Saved.'}
     elif path == '/api/settings/test': body = {'message': 'Connected.'}
+    elif path == '/api/job-matching': body = {"state": "idle", "message": "", "done": 0, "total": 0, "model": "", "effort": "", "running": False, "waiting": 0}
+    elif path == '/api/goldmove': body = {"state": "idle", "message": "", "done": 0, "total": 0, "running": False, "waiting": 0, "eligible": 0, "checked": 0, "dismissed": 0, "candidates": []}
+    elif path == '/api/master-resume': body = {"state": "idle", "message": "", "model": "", "effort": "", "started_at": "", "running": False, "has_cv": False, "built": None}
+    elif path == '/api/linkedin/continuous': body = {"running": False, "state": "stopped", "message": "Not running.", "found": 0, "skipped": 0, "next_at": "", "pages_last_hour": 0, "pages_today": 0}
     elif path.startswith('/api/'):
         raise AssertionError(f'Unexpected API request {path}')
     else:
@@ -105,6 +109,7 @@ with sync_playwright() as playwright:
     expect(prompt).to_have_value('Draft preserved while Codex works')
     page.locator('.nav a[href="#settings"]').click()
     form = page.locator('#settings-form')
+    form.locator('[name=provider]').select_option('ollama')
     form.locator('[name=model]').fill('saved-local-model')
     form.locator('[name=base_url]').fill('http://localhost:11434')
     form.locator('[name=provider]').select_option('compatible')

@@ -3,6 +3,7 @@ uvicorn>=0.30,<1
 httpx>=0.27,<1
 pydantic>=2.9,<3
 python-multipart>=0.0.18,<1
-pypdf>=5,<7
+pypdfium2>=4.30,<6
+pillow>=10,<13
 reportlab>=4.2,<5
 openai-codex==0.157.1

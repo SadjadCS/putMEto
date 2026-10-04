@@ -40,12 +40,18 @@ class Entries(Args):
     offset: int = Field(default=0, ge=0, le=10000)
 
 
-class Draft(ai.ExtractedItem):
+class ItemContent(ai.ItemFields):
+    original: str = Field(min_length=1, max_length=12000)
+    enhanced: str = Field(min_length=1, max_length=12000)
+
+
+class Draft(ItemContent):
     """All content is unconfirmed, even when supplied by a model."""
 
 
-class ReviewedItem(ai.ExtractedItem):
+class ReviewedItem(ItemContent):
     id: str = Field(min_length=1, max_length=100)
+    source: Literal["cv", "manual"] | None = None  # Accepted when an entry is sent back; never compared or changed.
 
 
 class ConfirmItems(Args):
@@ -108,7 +114,7 @@ def _get_job(args):
 
 
 def _draft(args):
-    entry = {"id": uuid4().hex, **args.model_dump(), "confirmed": False}
+    entry = {"id": uuid4().hex, **args.model_dump(), "confirmed": False, "source": "manual"}
     db.mutate_state(lambda state: state["items"].append(entry))
     return {"item": entry, "message": "Draft saved. The user must review its wording before confirmation."}
 
@@ -118,7 +124,7 @@ def _confirm_items(args):
     def save(state):
         for proposed in args.items:
             current = find_item(state["items"], proposed.id)
-            expected = proposed.model_dump()
+            expected = proposed.model_dump(exclude={"source"})
             if any(current.get(key, "") != value for key, value in expected.items()):
                 raise HTTPException(409, "This entry changed after it was proposed. Request a fresh review.")
             current["confirmed"] = True
@@ -167,7 +173,7 @@ def _catalog():
         "putmeto_confirm_items": ("Ask the user to review and confirm these EXACT existing resume entries. Requires a visible approval; only unchanged entries can be confirmed.", ConfirmItems, _confirm_items),
         "putmeto_confirm_suggestions": ("Ask the user to confirm exact existing skill or position suggestions. Requires a visible approval.", ConfirmBag, _confirm_bag),
         "putmeto_update_profile": ("Update only profile fields explicitly supplied by the user. Omitted fields are preserved. Never invent contact information or claims.", ProfilePatch, _profile),
-        "putmeto_suggest_skills": ("Suggest transferable techniques from confirmed experience and CV skills, plus clearly unverified related tools/databases. Optionally prioritize a saved job_id. Save drafts with evidence and rationale; the user confirms which they know.", main.SkillSuggestionsInput, main.suggest_skills),
+        "putmeto_suggest_skills": ("Suggest broad, meaningful professional skills aligned first with the CV's dedicated skills section, then supported and refined by confirmed experience. Use imported and confirmed skills when section metadata is unavailable. Consolidate implementation details, avoid redundant subskills and product lists, and clearly label any unverified related options. Optionally prioritize a saved job_id. Save drafts with evidence and rationale; the user confirms which they know.", main.SkillSuggestionsInput, main.suggest_skills),
         "putmeto_suggest_positions": ("Suggest relevant positions from confirmed resume entries; save unconfirmed suggestions for review.", Empty, lambda _: main.suggest_positions()),
         "putmeto_preferences": ("Save job preferences explicitly requested by the user: industry/academia, location and remote-only.", main.PreferencesInput, main.save_preferences),
         "putmeto_discover_jobs": ("Search the user's enabled job sources and save matching jobs. LinkedIn defaults to all roles in the United States and Europe.", Empty, lambda _: jobs.discover_jobs()),
@@ -176,7 +182,7 @@ def _catalog():
         "linkedin_study": ("Study bounded rendered LinkedIn headings and layout to understand the current job page. No hidden values or navigation.", Empty, lambda _: linkedin.study_page()),
         "linkedin_read_job": ("Open a LinkedIn job URL, read visible details and optionally save them locally. Stop on login, checkpoint or rate limits.", linkedin.ReadJob, linkedin.read_job),
         "linkedin_fill": ("Request review of exact user-supplied answers, then fill supported application fields from a fresh snapshot. Never submits or advances forms. Never guess answers.", linkedin.FillFields, linkedin.fill_fields),
-        "linkedin_search": ("Search and save a bounded batch of LinkedIn jobs. Default: all titles in United States and Europe. Stop on requires_action; never promise every listing.", jobs.LinkedInSearchBody, jobs.search_linkedin_jobs),
+        "linkedin_search": ("Search and save a bounded batch of LinkedIn jobs. Default: United States and Europe. Results matching neither the keywords nor a confirmed target position are skipped. Stop on requires_action; never promise every listing.", jobs.LinkedInSearchBody, jobs.search_linkedin_jobs),
         "linkedin_save_search": ("Save a named LinkedIn search to repeat later; does not visit LinkedIn.", linkedin.SavedSearch, linkedin.save_search),
         "linkedin_saved_searches": ("List local named LinkedIn searches and last-run status.", Empty, lambda _: linkedin.saved_searches()),
         "linkedin_run_search": ("Run an existing named LinkedIn search once by local ID and save its results.", ById, lambda args: linkedin.run_search(args.id)),

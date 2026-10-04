@@ -2,9 +2,9 @@
 
 import asyncio
 import copy
-import io
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -14,26 +14,38 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from pypdf import PdfReader
 from starlette.concurrency import run_in_threadpool
 
-from . import ai, db, resumes, skills
+from . import ai, ats, auto_apply, db, goldmove, job_matching, master_resume, resumes, roles, skill_grouping, skills, term_bags, xyz
+from .cv_import import pdf_pages
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_UPLOAD = 10 * 1024 * 1024
-IMPORT_AI_TIMEOUT = 300
+IMPORT_AI_TIMEOUT = 600  # PDFs take two AI steps: reading the pages, then structuring them.
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.initialize()
+    auto_apply.kick()  # Picks up where it left off when auto-apply is on.
+    skill_grouping.kick()  # Skills without a context group get one.
+    term_bags.kick()  # Your terms' other names, when the master CV changed.
+    goldmove.kick()  # Tailored resumes not checked for missing keywords yet.
     yield
     from .jobs import close_browsers
     from .linkedin import close_linkedin
+    from .linkedin_watch import stop as stop_continuous_search
     from .codex_bridge import get_bridge
     try:
+        await stop_continuous_search()
+        await master_resume.stop()
+        await job_matching.stop()
+        await auto_apply.stop()
+        await skill_grouping.stop()
+        await term_bags.stop()
+        await goldmove.stop()
         await get_bridge().close()
     finally:
         try:
@@ -99,16 +111,26 @@ class ProfileInput(Input):
 
 class ItemInput(Input):
     kind: Literal["experience", "project", "education", "publication"]
-    title: str = Field(min_length=1, max_length=300)
+    title: str = Field(min_length=1, max_length=600)
     organization: str = Field(default="", max_length=300)
     start: str = Field(default="", max_length=80)
     end: str = Field(default="", max_length=80)
-    original: str = Field(min_length=1, max_length=12000)
+    original: str = Field(default="", max_length=12000)
 
 
 class ItemUpdate(ItemInput):
     enhanced: str = Field(default="", max_length=12000)
     confirmed: bool = False
+    source: Literal["cv", "manual"] | None = None  # Accepted when an item is sent back; the saved value always wins.
+    # XYZ wording is changed through its own endpoint; values sent back here are ignored.
+    xyz: str | None = Field(default=None, max_length=12000)
+    xyz_basis: str | None = Field(default=None, max_length=64)
+    xyz_measured: list[bool] | None = Field(default=None, max_length=200)
+    xyz_current: bool | None = None
+
+
+class XYZInput(Input):
+    xyz: str = Field(min_length=1, max_length=12000)
 
 
 class BagItem(Input):
@@ -129,11 +151,26 @@ class SkillItem(BagItem):
     evidence: str | None = Field(default=None, max_length=2000)
     rationale: str | None = Field(default=None, max_length=2000)
     aliases: list[str] | None = Field(default=None, max_length=8)
-    origin: Literal["resume", "suggestion", "manual"] | None = None
+    origin: Literal["resume", "suggestion", "manual", "goldmove"] | None = None
+    source_section: Literal["skills", "experience", "other"] | None = None
+    category: str | None = Field(default=None, max_length=160)
+    group: str | None = Field(default=None, max_length=60)  # Shown on My profile; kept by skill_grouping, not here.
 
 
 class SkillsInput(Input):
     items: list[SkillItem] = Field(max_length=150)
+
+
+class PositionItem(BagItem):
+    # Round-tripped suggestion details; the saved values always win.
+    family: str | None = Field(default=None, max_length=60)
+    fit: Literal["strong", "possible"] | None = None
+    reason: str | None = Field(default=None, max_length=400)
+    origin: Literal["suggestion", "manual"] | None = None
+
+
+class PositionsInput(Input):
+    items: list[PositionItem] = Field(max_length=200)
 
 
 class SkillSuggestionsInput(Input):
@@ -168,6 +205,21 @@ class SettingsInput(Input):
 def sanitized_state(state: dict) -> dict:
     state = copy.deepcopy(state)
     state.pop("codex_chat", None)  # Chat has its own bounded endpoint.
+    state.pop("cv_transcript", None)  # Large, and only the server needs it.
+    groups = skill_grouping.group_of(state)
+    for skill in state["skills"]:
+        if skill["id"] in groups:
+            skill["group"] = groups[skill["id"]]
+    state["skill_group_order"] = skill_grouping.order(state)
+    state.pop("skill_grouping", None)
+    master = term_bags.master_key(state)
+    for job in state["jobs"]:
+        scores = ats.current(job, state, master) or {}  # The keywords and checks have their own endpoint.
+        job["ats_score"], job["ats_before"] = scores.get("score"), scores.get("before")
+        job.pop("ats", None)
+    for item in state["items"]:
+        if item.get("xyz"):
+            item["xyz_current"] = xyz.current(item)
     settings = state["settings"]
     settings["api_key_set"] = bool(settings.pop("api_key", ""))
     return state
@@ -210,105 +262,106 @@ def save_profile(payload: ProfileInput):
     return db.mutate_state(update)
 
 
-def _extract_text(content: bytes, filename: str, content_type: str = "") -> str:
-    # Exported PDFs can have no extension or a browser-supplied filename. Detect
-    # their actual header instead of rejecting a valid PDF based on its name.
-    filename = filename.strip().lower()
-    content_type = content_type.split(";", 1)[0].strip().lower()
-    is_pdf = b"%PDF-" in content[:1024] or filename.endswith(".pdf") or content_type == "application/pdf"
-    if is_pdf:
-        try:
-            reader = PdfReader(io.BytesIO(content))
-            if reader.is_encrypted and not reader.decrypt(""):
-                raise HTTPException(422, "This PDF is password protected. Upload an unlocked copy or a text file.")
-            if len(reader.pages) > 100:
-                raise HTTPException(422, "Upload a CV with at most 100 pages.")
-            parts, total = [], 0
-            for page in reader.pages:
-                text = page.extract_text() or ""
-                parts.append(text)
-                total += len(text)
-                if total > 70000:
-                    raise HTTPException(422, "This CV is too long. Upload at most 70,000 characters of text.")
-            text = "\n".join(parts)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(422, "This PDF could not be read. Export a fresh PDF or upload a UTF-8 .txt file.") from exc
-    elif (filename.endswith(".docx") or
-          content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" or
-          content.startswith(b"PK\x03\x04")):
-        from .documents import extract_docx
-        text = extract_docx(content)
-    elif filename.endswith(".doc") or content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
-        raise HTTPException(415, "This is an older Word .doc file. Save it as Word .docx or PDF, then upload it again.")
-    elif filename.endswith(".txt") or content_type == "text/plain":
-        try:
-            text = content.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise HTTPException(422, "Save the text file with UTF-8 encoding and try again.") from exc
-        if len(text) > 70000:
-            raise HTTPException(422, "This CV is too long. Upload at most 70,000 characters of text.")
-    else:
-        raise HTTPException(415, "This file could not be recognized as PDF, Word .docx, or a UTF-8 text CV. Export it as .docx or PDF and try again.")
-    if len(text.strip()) < 30:
-        raise HTTPException(422, "No readable CV text was found. Scanned PDFs need OCR first; you can also paste entries manually or upload a text file.")
-    return text.strip()
-
-
-async def read_cv(file: UploadFile) -> str:
+async def read_cv(file: UploadFile) -> list[bytes]:
     try:
         content = await file.read(MAX_UPLOAD + 1)
         if len(content) > MAX_UPLOAD:
             raise HTTPException(413, "The file is too large. Maximum file size is 10 MB.")
-        text = await run_in_threadpool(_extract_text, content, file.filename or "", file.content_type or "")
+        return await run_in_threadpool(pdf_pages, content, file.filename or "", file.content_type or "")
     finally:
         await file.close()
-    return text
+
+
+async def _extract_cv(file: UploadFile, extractor, timeout_message: str):
+    """The AI reads the PDF's pages, then structures what it read."""
+    pages = await read_cv(file)
+    settings = db.get_state()["settings"]
+
+    async def extract():
+        # With Codex, the strongest model reads the pages; reading needs no long reasoning.
+        reader, _ = await ai.strongest(settings)
+        try:
+            lines = await ai.transcribe_pdf(reader, pages)
+        except ai.ImagesUnsupported as exc:
+            raise HTTPException(422, "Your AI model cannot read PDF pages. Choose Codex or a vision-capable model in Settings.") from exc
+        return await extractor(settings, lines), lines
+    try:
+        return await asyncio.wait_for(extract(), IMPORT_AI_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        raise ai.AIError(timeout_message) from exc
+
+
+def _entry_key(item: dict) -> tuple:
+    return (item["kind"], *(skills.normalized_name(str(item.get(key) or "")) for key in ("title", "organization", "start")))
 
 
 @app.post("/api/import")
 async def import_resume(file: UploadFile = File(...)):
-    text = await read_cv(file)
-    try:
-        extracted = await asyncio.wait_for(ai.extract_resume(db.get_state()["settings"], text), IMPORT_AI_TIMEOUT)
-    except asyncio.TimeoutError as exc:
-        raise ai.AIError("Resume extraction timed out. No entries were imported. Try a shorter CV or another model in Settings.") from exc
+    extracted, lines = await _extract_cv(file, ai.extract_resume, "Resume extraction timed out. No entries were imported. Try a shorter CV or another model in Settings.")
     if not extracted.items and not extracted.skills:
         raise HTTPException(422, "The AI found no resume entries or technical skills. Try another model or add your experience manually.")
     def save(state):
         for key, value in extracted.profile.model_dump().items():
             if value and not state["profile"].get(key):
                 state["profile"][key] = value
+        # Importing the same CV again refreshes its entries with the CV's own
+        # wording instead of adding duplicates. Other entries are kept.
+        existing = {}
+        for item in state["items"]:
+            existing.setdefault(_entry_key(item), item)
+        added = updated = 0
         for entry in extracted.items:
-            state["items"].append({"id": uuid4().hex, **entry.model_dump(), "confirmed": False})
+            fields = {**entry.model_dump(), "enhanced": "", "confirmed": True, "source": "cv"}
+            current = existing.pop(_entry_key(fields), None)
+            if current is None:
+                state["items"].append({"id": uuid4().hex, **fields})
+                added += 1
+            elif any(current.get(key) != value for key, value in fields.items()):
+                current.update(fields)
+                updated += 1
         skill_count, _ = skills.merge_candidates(state, extracted.skills, origin="resume")
+        # Kept so the master resume can be rebuilt without another upload.
+        state["cv_transcript"] = {"lines": lines, "uploaded_at": datetime.now(timezone.utc).isoformat()}
         invalidate_resumes(state)
-        return skill_count
-    skill_count = db.mutate_state(save)
-    return {"count": len(extracted.items), "skill_count": skill_count, "message": f"Imported {len(extracted.items)} draft entries and {skill_count} technical skills. Review and confirm the wording and skills before using them in applications."}
+        skills.refresh_job_matches(state)
+        return added, updated, skill_count
+    added, updated, skill_count = db.mutate_state(save)
+    skill_grouping.kick()
+    term_bags.kick()
+    refreshed = f", updated {updated} existing {'entry' if updated == 1 else 'entries'}" if updated else ""
+    message = f"Imported {added} new entries{refreshed}, and {skill_count} new technical skills, using your CV's own wording. You can edit them anytime."
+    building = db.get_state()["settings"].get("provider") == "codex"
+    if building:
+        master_resume.start(lines)
+        message += " Codex is now building your master resume with its deepest reasoning; it replaces these entries when ready, which can take several minutes."
+    return {"count": len(extracted.items), "added": added, "updated": updated, "skill_count": skill_count, "master_resume": building, "message": message}
 
 
 @app.post("/api/import/skills")
 async def import_cv_skills(file: UploadFile = File(...)):
     """Recover the skills section without appending duplicate experience."""
-    text = await read_cv(file)
-    try:
-        extracted = await asyncio.wait_for(ai.extract_skills(db.get_state()["settings"], text), IMPORT_AI_TIMEOUT)
-    except asyncio.TimeoutError as exc:
-        raise ai.AIError("Reading CV skills timed out. No skills were imported. Try again or use a shorter CV.") from exc
+    extracted, _ = await _extract_cv(file, ai.extract_skills, "Reading CV skills timed out. No skills were imported. Try again or use a shorter CV.")
     if not extracted:
         raise HTTPException(422, "No technical skills were found. Check that the CV's skills section contains readable text, or add skills manually.")
-    count, updated = db.mutate_state(lambda state: skills.merge_candidates(state, extracted, origin="resume"))
-    return {"count": count, "skill_count": count, "updated": updated, "message": f"Imported {count} new skills and updated {updated} draft suggestions from your CV. Your saved experience was kept. Review the skills before confirming them."}
+    def save(state):
+        count, updated = skills.merge_candidates(state, extracted, origin="resume")
+        if count or updated:
+            invalidate_resumes(state)
+            skills.refresh_job_matches(state)
+        return count, updated
+    count, updated = db.mutate_state(save)
+    skill_grouping.kick()
+    term_bags.kick()
+    return {"count": count, "skill_count": count, "updated": updated, "message": f"Imported {count} new skills and updated {updated} existing skills from your CV. Imported skills are accepted and ready to use. You can change them anytime."}
 
 
 @app.post("/api/items", status_code=201)
 async def create_item(payload: ItemInput):
-    entry = {"id": uuid4().hex, **payload.model_dump(), "confirmed": False}
+    entry = {"id": uuid4().hex, **payload.model_dump(), "enhanced": "", "confirmed": False, "source": "manual"}
     warning = None
     try:
-        entry["enhanced"] = await ai.enhance_item(db.get_state()["settings"], entry)
+        if entry["original"].strip():
+            entry["enhanced"] = await ai.enhance_item(db.get_state()["settings"], entry)
     except ai.AIError as error:
         entry["enhanced"] = entry["original"]
         warning = f"Saved your original wording as a draft. {error}"
@@ -320,13 +373,17 @@ async def create_item(payload: ItemInput):
 async def update_item(item_id: str, payload: ItemUpdate):
     snapshot = db.get_state()
     previous = find_item(snapshot["items"], item_id)
-    entry = {"id": item_id, **payload.model_dump()}
+    entry = {"id": item_id, **payload.model_dump(exclude={"source", *xyz.FIELDS, "xyz_current"})}
+    if "source" in previous:
+        entry["source"] = previous["source"]  # Entries you added stay yours when a CV is imported again.
+    # The XYZ version stays; resumes ignore it automatically if the wording it came from changes.
+    entry.update({field: previous[field] for field in xyz.FIELDS if field in previous})
     source_changed = any(entry[key] != previous.get(key, "") for key in ItemInput.model_fields)
     warning = None
     if source_changed:
         entry["confirmed"] = False
         try:
-            entry["enhanced"] = await ai.enhance_item(snapshot["settings"], entry)
+            entry["enhanced"] = await ai.enhance_item(snapshot["settings"], entry) if entry["original"].strip() else ""
         except ai.AIError as error:
             entry["enhanced"] = entry["original"]
             warning = f"Saved your updated original as a draft. {error}"
@@ -341,13 +398,35 @@ async def update_item(item_id: str, payload: ItemUpdate):
         current.clear()
         current.update(entry)
     db.mutate_state(save)
+    term_bags.kick()  # Changed wording may use new technical terms.
     return {**entry, **({"warning": warning} if warning else {})}
+
+
+@app.put("/api/items/{item_id}/xyz")
+async def save_xyz(item_id: str, payload: XYZInput):  # Async: starting the matcher needs the event loop.
+    """Your own edit of an entry's Google XYZ wording, used in every resume."""
+    def save(state):
+        item = find_item(state["items"], item_id)
+        source = resumes.resume_source(item)
+        if not xyz.bullets(source):
+            raise HTTPException(400, "This entry has no bullets to show in XYZ form.")
+        # Numbers you type are your own facts, so any number counts as a measured result.
+        item.update(xyz=payload.xyz.strip(), xyz_basis=resumes.text_hash(source),
+                    xyz_measured=[bool(xyz.numbers(text)) for _, _, text in xyz.bullets(payload.xyz)])
+        if item.get("confirmed"):
+            invalidate_resumes(state)
+        return {**item, "xyz_current": True}
+    saved = db.mutate_state(save)
+    job_matching.kick()  # Tailored resumes are rebuilt with your wording.
+    return saved
 
 
 @app.post("/api/items/{item_id}/enhance")
 async def rephrase_item(item_id: str):
     snapshot = db.get_state()
     previous = find_item(snapshot["items"], item_id)
+    if not previous.get("original", "").strip():
+        raise HTTPException(400, "Add a description before asking the AI to rephrase it.")
     enhanced = await ai.enhance_item(snapshot["settings"], previous)
     def save(state):
         current = find_item(state["items"], item_id)
@@ -361,32 +440,15 @@ async def rephrase_item(item_id: str):
 
 
 @app.delete("/api/items/{item_id}")
-def delete_item(item_id: str):
+async def delete_item(item_id: str):
     def remove(state):
         item = find_item(state["items"], item_id)
         state["items"].remove(item)
         if item.get("confirmed"):
             invalidate_resumes(state)
     db.mutate_state(remove)
+    term_bags.kick()
     return {"message": "Entry deleted."}
-
-
-async def _suggest(kind: str):
-    snapshot = db.get_state()
-    if not any(item.get("confirmed") for item in snapshot["items"]):
-        raise HTTPException(400, "Confirm at least one resume entry before generating suggestions.")
-    names = await ai.suggest(snapshot["settings"], snapshot, kind)
-    def save(state):
-        seen = {item["name"].casefold() for item in state[kind]}
-        added = []
-        for name in names:
-            if name.casefold() not in seen:
-                item = {"id": uuid4().hex, "name": name, "confirmed": False}
-                state[kind].append(item)
-                added.append(item)
-                seen.add(name.casefold())
-        return {"items": state[kind], "count": len(added), "message": f"Added {len(added)} suggestions to review."}
-    return db.mutate_state(save)
 
 
 @app.post("/api/suggestions/skills")
@@ -404,16 +466,29 @@ async def suggest_skills(payload: SkillSuggestionsInput | None = None):
             raise HTTPException(409, "Your background changed while skills were being suggested. Try again to use the latest information.")
         count, updated = skills.merge_candidates(state, candidates, origin="suggestion")
         return {"items": state["skills"], "count": count, "updated": updated,
-                "message": f"Added {count} skill suggestions and updated {updated} drafts. Review techniques supported by your background and confirm only the related tools you know."}
-    return db.mutate_state(save)
+                "message": f"Added {count} skill suggestions and updated {updated} drafts. Review the suggested skills and confirm only those you know."}
+    saved = db.mutate_state(save)
+    skill_grouping.kick()
+    term_bags.kick()
+    return saved
 
 
 @app.post("/api/suggestions/positions")
 async def suggest_positions():
-    return await _suggest("positions")
+    """Every job title the confirmed master resume supports. The app runs this in the background with deep reasoning."""
+    snapshot = db.get_state()
+    if not any(item.get("confirmed") for item in snapshot["items"]):
+        raise HTTPException(400, "Confirm at least one resume entry before generating suggestions.")
+    found = await ai.suggest_roles(snapshot["settings"], snapshot)
+
+    def save(state):
+        added = roles.merge_roles(state, found)
+        return {"items": state["positions"], "count": added,
+                "message": f"Found {len(found)} job titles your experience supports; {added} are new. Check the ones you want to search for."}
+    return db.mutate_state(save)
 
 
-def _save_bag(kind: str, payload: BagInput | SkillsInput):
+def _save_bag(kind: str, payload: BagInput | SkillsInput | PositionsInput):
     items, names, ids = [], set(), set()
     for entry in payload.items:
         name_key = skills.normalized_name(entry.name) if kind == "skills" else entry.name.casefold()
@@ -440,6 +515,19 @@ def _save_bag(kind: str, payload: BagInput | SkillsInput):
             dismissed = state.setdefault("dismissed_skills", [])
             state["dismissed_skills"] = list(dict.fromkeys([*dismissed, *sorted(removed)]))[-1000:]
             state["dismissed_skills"] = [name for name in state["dismissed_skills"] if name not in retained]
+        else:
+            # Suggested roles keep their track, fit, and reason; removed suggestions are not offered again.
+            previous = {item["id"]: item for item in state[kind]}
+            for item in items:
+                old = previous.get(item["id"])
+                if old and old["name"] == item["name"]:
+                    item.update({field: old[field] for field in roles.ROLE_METADATA if field in old})
+                else:
+                    item["origin"] = "manual"
+            removed = {item["name"].casefold() for item in state[kind] if item["id"] not in ids and not item.get("confirmed")}
+            retained = {item["name"].casefold() for item in items}
+            dismissed = state.setdefault("dismissed_positions", [])
+            state["dismissed_positions"] = [name for name in dict.fromkeys([*dismissed, *sorted(removed)]) if name not in retained][-1000:]
         if kind == "skills" and [item for item in state[kind] if item.get("confirmed")] != [item for item in items if item["confirmed"]]:
             invalidate_resumes(state)
         state[kind] = items
@@ -450,12 +538,15 @@ def _save_bag(kind: str, payload: BagInput | SkillsInput):
 
 
 @app.put("/api/skills")
-def save_skills(payload: SkillsInput):
-    return _save_bag("skills", payload)
+async def save_skills(payload: SkillsInput):
+    saved = _save_bag("skills", payload)
+    skill_grouping.kick()  # A new skill joins a context group.
+    term_bags.kick()
+    return saved
 
 
 @app.put("/api/positions")
-def save_positions(payload: BagInput):
+def save_positions(payload: PositionsInput):
     return _save_bag("positions", payload)
 
 
@@ -490,13 +581,13 @@ async def test_settings():
     return {"message": f"Connected to {settings['model'] or 'Codex'}. Structured responses are working."}
 
 
-@app.post("/api/jobs/{job_id}/tailor")
-async def tailor_resume(job_id: str):
+async def tailor(job_id: str, settings: dict | None = None, effort: str | None = None, mark_prepared: bool = True) -> dict:
+    """A resume for one job from the confirmed master resume: most relevant entries and skills first, wording unchanged."""
     snapshot = db.get_state()
     job = find_item(snapshot["jobs"], job_id, "Job")
     if not any(item.get("confirmed") for item in snapshot["items"]):
         raise HTTPException(400, "Confirm at least one resume entry before tailoring a resume.")
-    order = await ai.order_resume(snapshot["settings"], snapshot, job)
+    order = await ai.order_resume(settings or snapshot["settings"], snapshot, job, effort=effort)
     resume = resumes.build_resume(snapshot, job)
     item_rank = {item_id: rank for rank, item_id in enumerate(dict.fromkeys(order.item_ids))}
     skill_rank = {skill_id: rank for rank, skill_id in enumerate(dict.fromkeys(order.skill_ids))}
@@ -509,17 +600,25 @@ async def tailor_resume(job_id: str):
         if any(state[key] != snapshot[key] for key in ("profile", "items", "skills")):
             raise HTTPException(409, "Your profile changed while tailoring. Try again to use the latest confirmed content.")
         current_job["resume"] = resume
-        if current_job.get("status") != "applied":
+        if mark_prepared and current_job.get("status") != "applied":
             current_job["status"] = "prepared"
     db.mutate_state(save)
+    return resume
+
+
+@app.post("/api/jobs/{job_id}/tailor")
+async def tailor_resume(job_id: str):
+    resume = await tailor(job_id)
+    goldmove.kick()
     return {"message": "Resume prepared with your confirmed wording, with the most relevant entries and skills first. Review it before applying.", "resume": resume}
 
 
 def _resume_for_job(job_id: str) -> dict:
-    job = find_item(db.get_state()["jobs"], job_id, "Job")
+    state = db.get_state()
+    job = find_item(state["jobs"], job_id, "Job")
     if not job.get("resume"):
         raise HTTPException(400, "Tailor a resume for this job first.")
-    return job["resume"]
+    return term_bags.job_resume(state, job)  # Using the posting's names for your terms.
 
 
 def _pdf_response(resume: dict) -> Response:
@@ -549,9 +648,18 @@ def job_pdf(job_id: str):
 
 from .jobs import router as jobs_router  # noqa: E402
 from .linkedin_routes import router as linkedin_agent_router  # noqa: E402
+from .linkedin_watch import router as linkedin_watch_router  # noqa: E402
 from .codex_routes import router as codex_router  # noqa: E402
 
 app.include_router(jobs_router)
+app.include_router(linkedin_watch_router)
+app.include_router(master_resume.router)
+app.include_router(job_matching.router)
+app.include_router(auto_apply.router)
+app.include_router(skill_grouping.router)
+app.include_router(ats.router)
+app.include_router(term_bags.router)
+app.include_router(goldmove.router)
 app.include_router(linkedin_agent_router)
 app.include_router(codex_router)
 app.mount("/static", StaticFiles(directory=ROOT / "static", check_dir=False), name="static")

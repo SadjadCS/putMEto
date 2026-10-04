@@ -1,4 +1,4 @@
-"""Offline Chrome smoke test for skill review, CV recovery, and job suggestions.
+"""Offline Chrome smoke test for compact skills, CV recovery, and job suggestions.
 
 Run: .venv/bin/python tests/browser_skills_smoke.py --artifacts artifacts/skills-browser
 Every request is intercepted. No real CV, workspace data, AI, or job site is used.
@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from io import BytesIO
 import mimetypes
 import os
 from pathlib import Path
 import sys
 from urllib.parse import urlsplit
-from zipfile import ZipFile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +67,27 @@ def smoke(artifacts: Path | None = None) -> None:
             route.abort()
         elif path == "/api/state":
             route.fulfill(json=workspace)
+        elif path == "/api/job-matching":
+            route.fulfill(json={"state": "idle", "message": "", "done": 0, "total": 0, "model": "", "effort": "", "running": False, "waiting": 0})
+        elif path == "/api/master-resume":
+            route.fulfill(json={"state": "idle", "message": "", "model": "", "effort": "", "started_at": "", "running": False, "has_cv": False, "built": None})
+        elif path == "/api/linkedin/continuous":
+            route.fulfill(json={"running": False, "state": "stopped", "message": "Not running.", "found": 0, "skipped": 0, "next_at": "", "pages_last_hour": 0, "pages_today": 0})
+        elif path.startswith("/api/jobs/") and path.endswith("/ats"):
+            route.fulfill(json={"ready": False, "message": ""})
+        elif path == "/api/goldmove":
+            route.fulfill(json={"state": "idle", "message": "", "done": 0, "total": 0, "running": False, "waiting": 0,
+                                "eligible": 0, "checked": 0, "dismissed": 0, "candidates": []})
+        elif path == "/api/skill-groups":
+            route.fulfill(json={"state": "idle", "message": "", "model": "", "effort": "", "running": False, "waiting": 0})
+        elif path == "/api/skill-groups/regroup" and request.method == "POST":
+            # The real grouping asks the AI; here each skill gets the group a model would choose.
+            contexts = {"Python": "Programming Languages", "R": "Programming Languages", "PostgreSQL": "Databases",
+                        "Vector databases": "Databases", "SQL querying": "Databases"}
+            for item in workspace["skills"]:
+                item["group"] = contexts.get(item["name"], "Data Engineering")
+            workspace["skill_group_order"] = ["Programming Languages", "Data Engineering", "Databases"]
+            route.fulfill(json={"state": "done", "message": "", "model": "", "effort": "", "running": False, "waiting": 0})
         elif path == "/api/skills" and request.method == "PUT":
             payload = request.post_data_json
             writes.append(deepcopy(payload))
@@ -116,29 +135,48 @@ def smoke(artifacts: Path | None = None) -> None:
             page.locator(f'.nav a[href="#{name}"]').click()
             expect(page.locator(f'.nav a[href="#{name}"]')).to_have_class("nav-item active")
 
+        def assert_compact_skills():
+            bounds = skills.locator("[data-skill-id]").evaluate_all("""elements => elements.map(element => {
+                const rect = element.getBoundingClientRect();
+                return {top: rect.top, bottom: rect.bottom, height: rect.height};
+            })""")
+            assert bounds and all(bound["height"] <= 48 for bound in bounds), "Skills should be small chips"
+            assert len({round(bound["top"]) for bound in bounds}) < len(bounds), "Skills should share wrapping rows"
+            assert max(bound["bottom"] for bound in bounds) - min(bound["top"] for bound in bounds) <= 160, "Skill list is too tall"
+
         try:
             page.goto(origin + "/#profile")
-            expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("Python")
-            expect(skills.locator('[data-skill-group="review"]')).to_contain_text("R")
-            expect(card("workflow")).to_contain_text("Technique")
-            expect(card("workflow")).to_contain_text("Listed in your CV")
-            expect(card("workflow")).to_contain_text("Orchestrated scheduled data pipelines using Apache Airflow.")
-            expect(card("workflow")).to_contain_text("Workflow-orchestration")
-            expect(card("airflow")).to_contain_text("Tool")
-            expect(card("postgres")).to_contain_text("Database")
-            expect(card("vectors")).to_contain_text("Explore and confirm")
+            expect(skills.locator("[data-skill-id]")).to_have_count(7)
+            expect(page.get_by_role("checkbox", name="Confirm Python", exact=True)).to_be_checked()
+            expect(page.get_by_role("checkbox", name="Confirm R", exact=True)).not_to_be_checked()
+            for skill in workspace["skills"]:
+                expect(card(skill["id"])).to_contain_text(skill["name"])
+                for field in ("evidence", "rationale"):
+                    if skill.get(field):
+                        expect(skills).not_to_contain_text(skill[field])
+                for alias in skill.get("aliases", []):
+                    expect(skills).not_to_contain_text(alias)
+            expect(skills.locator("[data-skill-group]")).to_have_count(0)
+            for metadata_label in ("Technique", "Listed in your CV", "Tool", "Database", "Explore and confirm", "Supporting context", "Related experience", "Also called:"):
+                expect(skills).not_to_contain_text(metadata_label)
+            assert_compact_skills()
             assert skills.locator("img").count() == 0
             assert page.evaluate("window.bad") is None
 
             page.get_by_role("checkbox", name="Confirm Workflow orchestration", exact=True).check()
-            expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("Workflow orchestration")
+            expect(page.get_by_role("checkbox", name="Confirm Workflow orchestration", exact=True)).to_be_checked()
+            expect(page.get_by_role("button", name="Remove Workflow orchestration", exact=True)).to_be_visible()
             saved = next(item for item in writes[-1]["items"] if item["id"] == "workflow")
             assert saved["confirmed"] is True and saved["evidence"] == "Orchestrated scheduled data pipelines using Apache Airflow."
             assert saved["aliases"] == ["Workflow-orchestration"]
+            assert saved["origin"] == "resume" and saved["support"] == "supported" and saved["kind"] == "technique"
+            assert saved["rationale"] == "A reusable data engineering technique demonstrated in your project."
             page.get_by_role("checkbox", name="Confirm Workflow orchestration", exact=True).uncheck()
-            expect(skills.locator('[data-skill-group="supported"]')).to_contain_text("Workflow orchestration")
+            expect(page.get_by_role("checkbox", name="Confirm Workflow orchestration", exact=True)).not_to_be_checked()
+            expect(page.get_by_role("button", name="Dismiss Workflow orchestration", exact=True)).to_be_visible()
+            assert next(item for item in writes[-1]["items"] if item["id"] == "workflow")["confirmed"] is False
             page.get_by_role("checkbox", name="Confirm PostgreSQL", exact=True).check()
-            expect(skills.locator('[data-skill-group="confirmed"]')).to_contain_text("PostgreSQL")
+            expect(page.get_by_role("checkbox", name="Confirm PostgreSQL", exact=True)).to_be_checked()
             assert next(item for item in writes[-1]["items"] if item["id"] == "postgres")["support"] == "related"
 
             page.get_by_role("button", name="Dismiss SQL querying", exact=True).click()
@@ -147,6 +185,9 @@ def smoke(artifacts: Path | None = None) -> None:
             page.get_by_label("Add a technical skill").fill("Docker")
             page.get_by_role("button", name="Add skill", exact=True).click()
             expect(page.get_by_role("checkbox", name="Confirm Docker", exact=True)).to_be_checked()
+            page.get_by_role("button", name="Remove Docker", exact=True).click()
+            expect(page.get_by_role("checkbox", name="Confirm Docker", exact=True)).to_have_count(0)
+            assert all(item["name"] != "Docker" for item in writes[-1]["items"])
             page.get_by_role("button", name="Suggest skills", exact=True).click()
             expect(page.get_by_role("button", name="Suggest skills", exact=True)).to_be_enabled()
             assert suggestions[-1] == {}
@@ -154,7 +195,8 @@ def smoke(artifacts: Path | None = None) -> None:
             page.get_by_role("button", name="Import skills from CV", exact=True).click()
             form = page.locator("#import-form")
             expect(form).to_have_attribute("data-mode", "skills")
-            expect(form).to_contain_text("keeps your existing experience entries")
+            expect(form).to_contain_text("adds confirmed skills and keeps your existing experience entries")
+            expect(page.locator("#modal")).to_contain_text("Extracted skills are confirmed automatically")
             picker = form.locator("input[type=file]")
             picker.set_input_files({"name": "fixture.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\nSynthetic skills fixture"})
             submit = form.locator("button[type=submit]")
@@ -166,19 +208,20 @@ def smoke(artifacts: Path | None = None) -> None:
             expect(form.locator("#import-error")).to_contain_text("Please retry skills extraction.")
             expect(form.locator("#import-error")).to_be_visible()
             expect(submit).to_be_enabled()
-            document = BytesIO()
-            with ZipFile(document, "w") as archive:
-                archive.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Skills: vector indexing.</w:t></w:r></w:p></w:body></w:document>')
-            picker.set_input_files({"name": "fixture.docx", "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "buffer": document.getvalue()})
+            picker.set_input_files({"name": "fixture-retry.pdf", "mimeType": "application/pdf", "buffer": b"%PDF-1.4\nSynthetic skills retry"})
             with page.expect_request(lambda request: urlsplit(request.url).path == "/api/import/skills"):
                 submit.click()
             expect(submit).to_be_disabled()
-            assert b'filename="fixture.docx"' in imports[-1].post_data_buffer
-            workspace["skills"].append({"id": "indexing", "name": "Vector indexing", "kind": "technique", "support": "supported", "origin": "resume", "confirmed": False, "evidence": "Skills: vector indexing."})
-            pending_imports.pop().fulfill(json={"count": 1, "skill_count": 1, "message": "Imported a skill for review."})
+            assert b'filename="fixture-retry.pdf"' in imports[-1].post_data_buffer
+            workspace["skills"].append({"id": "indexing", "name": "Vector indexing", "kind": "technique", "support": "supported", "origin": "resume", "confirmed": True, "evidence": "Skills: vector indexing."})
+            pending_imports.pop().fulfill(json={"count": 1, "skill_count": 1, "message": "CV skills imported and confirmed."})
             expect(page.locator("#modal")).not_to_be_visible()
-            expect(card("indexing")).to_contain_text("Listed in your CV")
+            expect(card("indexing")).to_contain_text("Vector indexing")
+            expect(card("indexing")).not_to_contain_text("Skills: vector indexing.")
+            expect(page.get_by_role("checkbox", name="Confirm Vector indexing", exact=True)).to_be_checked()
+            page.get_by_role("checkbox", name="Confirm Vector indexing", exact=True).uncheck()
             expect(page.get_by_role("checkbox", name="Confirm Vector indexing", exact=True)).not_to_be_checked()
+            assert next(item for item in writes[-1]["items"] if item["id"] == "indexing")["confirmed"] is False
             assert workspace["items"] == original_items
             assert len(imports) == 2
 
@@ -189,15 +232,36 @@ def smoke(artifacts: Path | None = None) -> None:
             expect(page.locator("#job-skills-status")).to_contain_text("Retry shortly")
             page.get_by_role("button", name="Suggest relevant skills", exact=True).click()
             expect(page.locator("#modal")).not_to_be_visible()
-            expect(card("data-quality")).to_contain_text("Relevant to the saved Data engineer opportunity")
+            expect(card("data-quality")).to_contain_text("Data quality checks")
+            expect(skills).not_to_contain_text("Relevant to the saved Data engineer opportunity")
+            expect(page.get_by_role("checkbox", name="Confirm Data quality checks", exact=True)).not_to_be_checked()
             assert suggestions[-1] == {"job_id": "fixture-job"}
             assert page.url.endswith("#profile?skills")
 
             while page.get_by_role("button", name="Dismiss notification", exact=True).count():
                 page.get_by_role("button", name="Dismiss notification", exact=True).first.click()
+            assert_compact_skills()
             if artifacts:
                 skills.screenshot(path=str(artifacts / "skills-desktop.png"))
+
+            # Skills are shown in context groups, in the order the AI chose.
+            skills.get_by_role("button", name="Group by context", exact=True).click()
+            expect(skills.locator(".skill-group h3")).to_have_count(3)
+            assert [text.split("\n")[0].rstrip("0123456789") for text in skills.locator(".skill-group h3").all_inner_texts()] == \
+                ["Programming Languages", "Data Engineering", "Databases"]
+            languages = skills.locator(".skill-group").filter(has=page.get_by_role("heading", name="Programming Languages"))
+            expect(languages.locator("[data-skill-id]")).to_have_count(2)
+            expect(languages).to_contain_text("Python")
+            expect(skills.locator(".skill-group").filter(has_text="Databases")).to_contain_text("PostgreSQL")
+            assert_compact_skills_in_groups = skills.locator(".skill-group .chip-list").count() == 3
+            assert assert_compact_skills_in_groups
+            if artifacts:
+                skills.screenshot(path=str(artifacts / "skills-grouped.png"))
             page.set_viewport_size({"width": 390, "height": 844})
+            long_skill = "Designing and maintaining reliable data systems for large international research collaborations"
+            page.get_by_label("Add a technical skill").fill(long_skill)
+            page.get_by_role("button", name="Add skill", exact=True).click()
+            expect(page.get_by_role("checkbox", name=f"Confirm {long_skill}", exact=True)).to_be_checked()
             skills.scroll_into_view_if_needed()
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Mobile horizontal overflow"
             if artifacts:
@@ -209,7 +273,7 @@ def smoke(artifacts: Path | None = None) -> None:
             raise
         finally:
             browser.close()
-    print("Skills browser checks passed: grouped evidence, legacy skills, confirmation/dismissal, metadata preservation, safe text, skills-only PDF/DOCX import/retry, job suggestions, and mobile layout.")
+    print("Skills browser checks passed: compact chips, hidden source details, legacy skills, confirmation/dismissal, add/remove, metadata preservation, safe text, confirmed skills-only PDF import/retry, unconfirmed job suggestions, context groups, and mobile layout.")
 
 
 if __name__ == "__main__":

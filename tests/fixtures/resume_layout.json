@@ -1,0 +1,63 @@
+{
+  "profile": {
+    "name": "Alex Morgan",
+    "headline": "Senior Software Engineer · AI & Data Platforms",
+    "email": "alex.morgan@example.com",
+    "phone": "+1 (212) 555-0142",
+    "location": "New York, NY",
+    "website": "alexmorgan.example.com",
+    "summary": "Software engineer with eight years of experience turning complex data into reliable products. Builds thoughtful AI applications, leads cross-functional delivery, and makes systems easier to operate."
+  },
+  "items": [
+    {
+      "kind": "experience",
+      "title": "Senior Software Engineer",
+      "organization": "Northstar Labs",
+      "start": "2022",
+      "end": "Present",
+      "original": "Original wording replaced by the reviewed description.",
+      "enhanced": "Led a team of five engineers delivering an AI research assistant used by 12,000 analysts.\nReduced document retrieval latency by 42% through indexing and API improvements.\nBuilt evaluation workflows that made release decisions repeatable and transparent."
+    },
+    {
+      "kind": "experience",
+      "title": "Software Engineer",
+      "organization": "Fieldwork Analytics",
+      "start": "2018",
+      "end": "2022",
+      "original": "Developed Python services and SQL pipelines supporting daily operational reporting.\nCollaborated with product and design to simplify onboarding for enterprise teams."
+    },
+    {
+      "kind": "project",
+      "title": "Open Research Atlas",
+      "organization": "Independent project",
+      "start": "2023",
+      "end": "2024",
+      "enhanced": "Created an open-source tool that helps researchers explore and compare public datasets.\nDesigned accessible search and export features for nontechnical collaborators."
+    },
+    {
+      "kind": "education",
+      "title": "B.S. in Computer Science",
+      "organization": "Northeastern University",
+      "start": "2014",
+      "end": "2018",
+      "original": "Concentration in distributed systems and human-computer interaction."
+    },
+    {
+      "kind": "publication",
+      "title": "Practical Evaluation of Retrieval Systems",
+      "organization": "Applied Computing Review",
+      "start": "2024",
+      "original": "Co-authored a practitioner guide to evaluating search quality with limited labeled data."
+    }
+  ],
+  "skills": [
+    "Software engineering",
+    "LLM application development",
+    "Data engineering",
+    "API design",
+    "Python",
+    "SQL",
+    "TypeScript",
+    "Technical leadership"
+  ]
+}

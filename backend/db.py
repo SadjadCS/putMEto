@@ -30,7 +30,9 @@ def default_state() -> dict:
         "jobs": [],
         "linkedin_searches": [],
         "applications": [],
-        "settings": {"provider": "ollama", "base_url": "http://127.0.0.1:11434", "model": "llama3.2", "api_key": ""},
+        "application_answers": {},
+        "auto_apply": {"enabled": False},
+        "settings": {"provider": "codex", "base_url": "", "model": "", "api_key": ""},
     }
 
 

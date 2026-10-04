@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
+import random
 import re
+import sys
+import time
+from collections import deque
 from contextlib import suppress
 from html.parser import HTMLParser
 from urllib.parse import urlencode, urlsplit
@@ -22,6 +27,44 @@ from backend.network import SourceError, validate_public_url, validate_url_shape
 _session: dict | None = None
 _search_lock = asyncio.Lock()
 _cleanup_tasks: set[asyncio.Task] = set()
+GATES = {"login", "checkpoint", "rate_limited"}
+RESULTS_PER_PAGE = 25
+# LinkedIn watches for bursts of page loads. Every navigation waits a random,
+# human-scale gap after the previous one, whichever search asked for it.
+SEARCH_GAP = (4.0, 9.0)
+_last_navigation = 0.0
+_background_step = False
+PACE_FILE = "linkedin-pace.json"
+navigations: deque[float] = deque(maxlen=2000)
+_navigations_loaded = False
+
+
+def recent_navigations() -> deque[float]:
+    """Wall-clock times of LinkedIn page loads, kept across restarts so limits can't be reset by restarting."""
+    global _navigations_loaded
+    if not _navigations_loaded:
+        _navigations_loaded = True
+        with suppress(OSError, ValueError, TypeError):
+            cutoff = time.time() - 86400
+            navigations.extend(sorted(float(moment) for moment in json.loads((db.DATA_DIR / PACE_FILE).read_text()) if float(moment) > cutoff))
+    return navigations
+
+
+async def wait_gap(gap: tuple[float, float]) -> None:
+    """Sleep until a random gap has passed since the previous LinkedIn page load."""
+    delay = _last_navigation + random.uniform(*gap) - time.monotonic()
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
+async def _pause(gap: tuple[float, float]) -> None:
+    global _last_navigation
+    await wait_gap(gap)
+    _last_navigation = time.monotonic()
+    recent = recent_navigations()
+    recent.append(time.time())
+    with suppress(OSError):
+        (db.DATA_DIR / PACE_FILE).write_text(json.dumps([moment for moment in recent if time.time() - moment < 86400]))
 CARD_SELECTOR = ".base-search-card, .base-card, .job-card-container, .job-card-list, .jobs-search-results__list-item, [data-job-id]"
 
 # Fixed DOM readers; page text is always treated as data.
@@ -100,6 +143,89 @@ class _ContextBrowser:
             self.context.on("close", lambda *_: callback(self))
 
 
+IDENTITY_FILE = "linkedin-browser-identity.json"
+SESSION_FILE = "linkedin-session.json"
+SIGN_IN_COOKIE = "li_at"
+LINKEDIN_URLS = ["https://www.linkedin.com"]
+
+
+def _write_private(path, text: str) -> None:
+    with suppress(OSError):
+        path.write_text(text)
+        path.chmod(0o600)
+
+
+async def _remember_sign_in(context) -> None:
+    """Keep a private copy of LinkedIn's sign-in cookies whenever you are signed in."""
+    with suppress(Exception):
+        cookies = await context.cookies(LINKEDIN_URLS)
+        if any(cookie["name"] == SIGN_IN_COOKIE for cookie in cookies):
+            _write_private(db.DATA_DIR / SESSION_FILE, json.dumps(cookies))
+
+
+async def _restore_sign_in(context) -> bool:
+    """Put the saved LinkedIn sign-in back when the browser profile has lost it."""
+    with suppress(Exception):
+        if any(cookie["name"] == SIGN_IN_COOKIE for cookie in await context.cookies(LINKEDIN_URLS)):
+            return False
+        saved = json.loads((db.DATA_DIR / SESSION_FILE).read_text())
+        sign_in = next((cookie for cookie in saved if cookie.get("name") == SIGN_IN_COOKIE), None)
+        if sign_in is None or 0 < sign_in.get("expires", -1) < time.time():
+            return False
+        # Session cookies are reported with expires -1; they are added back without one.
+        await context.add_cookies([{key: value for key, value in cookie.items() if key != "expires" or value > 0} for cookie in saved])
+        return True
+    return False
+
+
+def _forget_sign_in(session: dict) -> None:
+    """LinkedIn refused a restored sign-in (for example after you signed out): drop the copy instead of retrying it."""
+    if session.get("restored_sign_in"):
+        session["restored_sign_in"] = False
+        with suppress(OSError):
+            (db.DATA_DIR / SESSION_FILE).unlink()
+
+
+def _usable(identity: dict) -> bool:
+    """Camoufox can build a browser from this identity (some presets name graphics data it lacks)."""
+    try:
+        from camoufox.utils import launch_options
+        launch_options(headless=True, fingerprint_preset=identity.get("preset"), config=dict(identity["config"]))
+        return True
+    except Exception:
+        return False
+
+
+def _browser_identity() -> dict:
+    """The LinkedIn browser's device identity, chosen once and reused on every launch.
+
+    Camoufox otherwise presents a new device at each launch (user agent, screen,
+    graphics, fonts, and fingerprint noise), and LinkedIn signs out a session
+    whose device keeps changing. Returns {} if no identity can be made.
+    """
+    path = db.DATA_DIR / IDENTITY_FILE
+    with suppress(OSError, ValueError, TypeError, AttributeError):
+        saved = json.loads(path.read_text())
+        if saved.get("config") and _usable(saved):
+            return saved
+    try:
+        from camoufox.fingerprints import _generate_random_font_subset, _generate_random_voice_subset, get_random_preset
+        from camoufox.pkgman import installed_verstr
+        os_name = {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
+        config = {
+            "fonts": _generate_random_font_subset(os_name), "voices": _generate_random_voice_subset(os_name),
+            **{key: random.randint(1, 4_294_967_295) for key in ("fonts:spacing_seed", "audio:seed", "canvas:seed")},
+        }
+        version = installed_verstr().split(".", 1)[0]
+        candidates = [{"preset": get_random_preset(os=os_name, ff_version=version), "config": config} for _ in range(8)]
+    except Exception:
+        return {}
+    identity = next((candidate for candidate in candidates + [{"preset": None, "config": config}] if _usable(candidate)), {})
+    if identity:
+        _write_private(path, json.dumps(identity))
+    return identity
+
+
 async def _launch(headless: bool):
     """Open the dedicated on-disk profile without inspecting its credentials."""
     try:
@@ -112,9 +238,13 @@ async def _launch(headless: bool):
         profile.chmod(0o700)
     except OSError as exc:
         raise SourceError("The LinkedIn browser profile cannot be saved. Check write permissions for PutMeTo's data folder.") from exc
+    identity = _browser_identity()
+    pinned = {"config": dict(identity["config"])} if identity.get("config") else {}
+    if identity.get("preset"):
+        pinned["fingerprint_preset"] = identity["preset"]
     manager = AsyncCamoufox(
         headless=headless, persistent_context=True, user_data_dir=str(profile),
-        service_workers="block", accept_downloads=False,
+        service_workers="block", accept_downloads=False, **pinned,
     )
     try:
         context = await asyncio.wait_for(manager.__aenter__(), timeout=60)
@@ -138,7 +268,7 @@ async def _launch(headless: bool):
         raise SourceError("The LinkedIn browser could not open its saved profile. Close other PutMeTo or CLI browsers using this profile and try again. " + INSTALL_HELP) from exc
 
 
-def build_search_url(keywords: str, location: str = "", remote_only: bool = False) -> str:
+def build_search_url(keywords: str, location: str = "", remote_only: bool = False, start: int = 0) -> str:
     if not isinstance(keywords, str):
         raise SourceError("LinkedIn search keywords must be text; leave them blank to search all roles.")
     if len(keywords) > 300 or not isinstance(location, str) or len(location) > 300:
@@ -150,6 +280,8 @@ def build_search_url(keywords: str, location: str = "", remote_only: bool = Fals
         params["location"] = location.strip()
     if remote_only:
         params["f_WT"] = "2"
+    if start:
+        params["start"] = str(start)
     return "https://www.linkedin.com/jobs/search/" + ("?" + urlencode(params) if params else "")
 
 
@@ -295,7 +427,7 @@ async def close_linkedin():
         await asyncio.gather(*list(_cleanup_tasks), return_exceptions=True)
 
 
-async def _get_session() -> dict:
+async def _get_session(open_new: bool = True) -> dict:
     global _session
     if _session and _session["browser"].is_connected():
         page = _session["page"]
@@ -308,6 +440,8 @@ async def _get_session() -> dict:
         if _session:
             return _session
     await _close_session()
+    if not open_new:
+        raise SourceError("The LinkedIn window was closed.")
     manager, browser, context = await _launch(headless=False)
     try:
         available = [page for page in context.pages if not page.is_closed()]
@@ -323,6 +457,7 @@ async def _get_session() -> dict:
         for existing_page in context.pages:
             track_page(existing_page)
         context.on("page", track_page)
+        session["restored_sign_in"] = await _restore_sign_in(context)
         return session
     except BaseException:
         with suppress(Exception):
@@ -413,11 +548,94 @@ async def _extract_detail(page, job: dict) -> dict:
     return normalize_job(combined)
 
 
+DETAIL_GATE_WARNING = "Full descriptions could not be read for every result; available job cards are included."
+
+
+async def _load_results(session: dict, search_url: str, remote_only: bool, limit: int, gap: tuple[float, float]) -> tuple[str, list[dict], list[str]]:
+    """Open one results page: ("ready" | "empty" | "unreadable" | a gate, cards, warnings)."""
+    page = session["page"]
+    if session.get("requires_action"):
+        # Preserve an unfinished login or challenge instead of replacing it.
+        existing_cards = []
+        with suppress(Exception):
+            existing_cards = await _extract_cards(page)
+        existing = classify_page(await _page_snapshot(page, None, bool(existing_cards)))
+        if existing in {"login", "checkpoint"}:
+            if existing == "login":
+                _forget_sign_in(session)
+            return existing, [], []
+    await _pause(gap)
+    response = await page.goto(search_url, wait_until="domcontentloaded", timeout=35_000)
+    await validate_public_url(page.url)
+    status = response.status if response else None
+    with suppress(Exception):
+        await page.wait_for_selector(CARD_SELECTOR + ', form[action*="login-submit"], input#username, #captcha-internal', timeout=6000, state="attached")
+    jobs = (await _extract_cards(page))[:limit]
+    if remote_only:
+        for job in jobs:
+            job["remote"] = True
+    state = classify_page(await _page_snapshot(page, status, bool(jobs)))
+    if state in GATES:
+        if state == "login":
+            _forget_sign_in(session)
+        return state, jobs, []
+    await _remember_sign_in(session.get("context"))
+    if state == "empty":
+        return "empty", [], []
+    if not jobs:
+        return "unreadable", [], ["The page loaded without recognizable job cards. LinkedIn may have changed its layout or the page may not have finished loading."]
+    return "ready", jobs, []
+
+
+async def _load_detail(session: dict, job: dict, remote_only: bool, gap: tuple[float, float]) -> tuple[str, dict, str]:
+    """Open one job page: ("ready" | a gate, the job with any details read, a warning or "")."""
+    page = session["page"]
+    try:
+        await _pause(gap)
+        response = await page.goto(job["url"], wait_until="domcontentloaded", timeout=15_000)
+        await validate_public_url(page.url)
+        status = response.status if response else None
+        snapshot = await _page_snapshot(page, status, False)
+        state = classify_page(snapshot)
+        # An actual authwall/checkpoint ends browsing immediately.
+        # A public job page can include an incidental sign-in form.
+        job_page = False
+        with suppress(SourceError):
+            canonical_job_url(snapshot.get("url", ""))
+            job_page = True
+        incidental_form = state == "login" and job_page and snapshot.get("has_login_form") and snapshot.get("status") not in {401, 403, 999}
+        if state in GATES and not incidental_form:
+            if state == "login":
+                _forget_sign_in(session)
+            return state, job, DETAIL_GATE_WARNING
+        with suppress(Exception):
+            await page.wait_for_selector('.show-more-less-html__markup, .jobs-description__content, .jobs-description-content__text, script[type="application/ld+json"]', timeout=3500, state="attached")
+        detail = await _extract_detail(page, job)
+        state = classify_page({**snapshot, "has_jobs": bool(detail.get("description"))})
+        if state in GATES:
+            return state, job, DETAIL_GATE_WARNING
+        if status and status >= 400:
+            return "ready", job, f"{job['title']}: the detail page returned HTTP {status}; saved the search card."
+        await _remember_sign_in(session.get("context"))
+        if remote_only:
+            detail["remote"] = True
+        return "ready", detail, "" if detail["description"] else f"{job['title']}: no full description was available; saved the search card."
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        with suppress(Exception):
+            state = classify_page(await _page_snapshot(page, None, False))
+            if state in GATES:
+                return state, job, DETAIL_GATE_WARNING
+        return "ready", job, f"{job['title']}: the detail page could not be read; saved the search card."
+
+
 async def search_linkedin(keywords: str, location: str = "", remote_only: bool = False, limit: int = 10) -> dict:
     search_url = build_search_url(keywords, location, remote_only)
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 25:
         raise SourceError("Choose between 1 and 25 LinkedIn jobs per search.")
-    if _search_lock.locked():
+    # A background search holds the browser for one page at a time; wait for it.
+    if _search_lock.locked() and not _background_step:
         raise SourceError("A LinkedIn search is already running. Wait for it to finish.")
     async with _search_lock:
         await validate_public_url(search_url)
@@ -425,74 +643,22 @@ async def search_linkedin(keywords: str, location: str = "", remote_only: bool =
         page = session["page"]
         jobs, warnings = [], []
         try:
-            async with asyncio.timeout(210):
-                if session.get("requires_action"):
-                    # Preserve an unfinished login or challenge instead of replacing it.
-                    existing_cards = []
-                    with suppress(Exception):
-                        existing_cards = await _extract_cards(page)
-                    existing = classify_page(await _page_snapshot(page, None, bool(existing_cards)))
-                    if existing in {"login", "checkpoint"}:
-                        return _result(session, jobs, search_url, warnings, _gate_message(existing), True)
-                response = await page.goto(search_url, wait_until="domcontentloaded", timeout=35_000)
-                await validate_public_url(page.url)
-                status = response.status if response else None
-                with suppress(Exception):
-                    await page.wait_for_selector(CARD_SELECTOR + ', form[action*="login-submit"], input#username, #captcha-internal', timeout=6000, state="attached")
-                jobs = (await _extract_cards(page))[:limit]
-                if remote_only:
-                    for job in jobs:
-                        job["remote"] = True
-                state = classify_page(await _page_snapshot(page, status, bool(jobs)))
-                if state in {"login", "checkpoint", "rate_limited"}:
+            # Paced page loads take a few seconds each, so allow for a full batch.
+            async with asyncio.timeout(60 + limit * (SEARCH_GAP[1] + 15)):
+                state, jobs, notes = await _load_results(session, search_url, remote_only, limit, SEARCH_GAP)
+                warnings.extend(notes)
+                if state in GATES:
                     return _result(session, jobs, search_url, warnings, _gate_message(state), True)
                 if state == "empty":
                     return _result(session, [], search_url, warnings, "LinkedIn returned no jobs for this search. Try broader keywords or a different location.")
-                if not jobs:
-                    warnings.append("The page loaded without recognizable job cards. LinkedIn may have changed its layout or the page may not have finished loading.")
+                if state == "unreadable":
                     return _result(session, [], search_url, warnings, "No job cards could be read. Inspect the open LinkedIn window, then retry or add a job URL manually.")
-
                 for index, job in enumerate(jobs):
-                    try:
-                        response = await page.goto(job["url"], wait_until="domcontentloaded", timeout=15_000)
-                        await validate_public_url(page.url)
-                        status = response.status if response else None
-                        snapshot = await _page_snapshot(page, status, False)
-                        state = classify_page(snapshot)
-                        # An actual authwall/checkpoint ends browsing immediately.
-                        # A public job page can include an incidental sign-in form.
-                        job_page = False
-                        with suppress(SourceError):
-                            canonical_job_url(snapshot.get("url", ""))
-                            job_page = True
-                        incidental_form = state == "login" and job_page and snapshot.get("has_login_form") and snapshot.get("status") not in {401, 403, 999}
-                        if state in {"login", "checkpoint", "rate_limited"} and not incidental_form:
-                            warnings.append("Full descriptions could not be read for every result; available job cards are included.")
-                            return _result(session, jobs, search_url, warnings, _gate_message(state), True)
-                        with suppress(Exception):
-                            await page.wait_for_selector('.show-more-less-html__markup, .jobs-description__content, .jobs-description-content__text, script[type="application/ld+json"]', timeout=3500, state="attached")
-                        detail = await _extract_detail(page, job)
-                        state = classify_page({**snapshot, "has_jobs": bool(detail.get("description"))})
-                        if state in {"login", "checkpoint", "rate_limited"}:
-                            warnings.append("Full descriptions could not be read for every result; available job cards are included.")
-                            return _result(session, jobs, search_url, warnings, _gate_message(state), True)
-                        if status and status >= 400:
-                            warnings.append(f"{job['title']}: the detail page returned HTTP {status}; saved the search card.")
-                            continue
-                        jobs[index] = detail
-                        if remote_only:
-                            jobs[index]["remote"] = True
-                        if not jobs[index]["description"]:
-                            warnings.append(f"{job['title']}: no full description was available; saved the search card.")
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        with suppress(Exception):
-                            state = classify_page(await _page_snapshot(page, None, False))
-                            if state in {"login", "checkpoint", "rate_limited"}:
-                                warnings.append("Full descriptions could not be read for every result; available job cards are included.")
-                                return _result(session, jobs, search_url, warnings, _gate_message(state), True)
-                        warnings.append(f"{job['title']}: the detail page could not be read; saved the search card.")
+                    state, jobs[index], warning = await _load_detail(session, job, remote_only, SEARCH_GAP)
+                    if warning:
+                        warnings.append(warning)
+                    if state in GATES:
+                        return _result(session, jobs, search_url, warnings, _gate_message(state), True)
                 message = f"Read {len(jobs)} LinkedIn {'job' if len(jobs) == 1 else 'jobs'}. The browser stays open for review."
                 return _result(session, jobs, search_url, warnings, message)
         except TimeoutError:
@@ -505,6 +671,64 @@ async def search_linkedin(keywords: str, location: str = "", remote_only: bool =
                 raise SourceError("The LinkedIn browser was closed. Search again to open a new window.") from exc
             with suppress(Exception):
                 state = classify_page(await _page_snapshot(page, None, False))
-                if state in {"login", "checkpoint", "rate_limited"}:
+                if state in GATES:
                     return _result(session, jobs, search_url, warnings, _gate_message(state), True)
             raise SourceError("LinkedIn could not be loaded. Inspect the open browser, check your connection, and try again.") from exc
+
+
+async def _step(work, open_new: bool) -> dict:
+    """Run one page load of a background search while holding the shared browser."""
+    global _background_step
+    async with _search_lock:
+        _background_step = True
+        try:
+            return await _run_step(work, open_new)
+        finally:
+            _background_step = False
+
+
+async def _run_step(work, open_new: bool) -> dict:
+    session = await _get_session(open_new)
+    page = session["page"]
+    try:
+        async with asyncio.timeout(90):
+            return await work(session)
+    except TimeoutError:
+        return {"state": "unreadable", "message": "LinkedIn took too long to respond."}
+    except SourceError:
+        raise
+    except Exception as exc:
+        if page.is_closed() or not session["browser"].is_connected():
+            raise SourceError("The LinkedIn window was closed.") from exc
+        raise SourceError("LinkedIn could not be loaded. Check the open browser and your connection.") from exc
+
+
+async def read_results_page(keywords: str, location: str, remote_only: bool, start: int, open_new: bool = False) -> dict:
+    """One results page for a background search, without the search's own pacing: the caller paces."""
+    search_url = build_search_url(keywords, location, remote_only, start)
+    await validate_public_url(search_url)
+
+    async def work(session):
+        state, jobs, _ = await _load_results(session, search_url, remote_only, RESULTS_PER_PAGE, (0.0, 0.0))
+        message = _gate_message(state) if state in GATES else ""
+        _result(session, jobs, search_url, [], message or "LinkedIn browser is open.", state in GATES)
+        return {"state": state, "jobs": jobs, "message": message}
+    return await _step(work, open_new)
+
+
+async def read_job_page(job: dict, remote_only: bool = False, open_new: bool = False) -> dict:
+    """One job page for a background search, without the search's own pacing: the caller paces."""
+    async def work(session):
+        state, detail, _ = await _load_detail(session, job, remote_only, (0.0, 0.0))
+        if state in GATES:
+            _result(session, [], session.get("search_url", ""), [], _gate_message(state), True)
+        return {"state": state, "job": detail, "message": _gate_message(state) if state in GATES else ""}
+    return await _step(work, open_new)
+
+
+async def check_gate() -> str:
+    """The open page's gate ("login", "checkpoint", "rate_limited"), or "clear" once dealt with. Loads nothing."""
+    async def work(session):
+        state = classify_page(await _page_snapshot(session["page"], None, False))
+        return {"state": state if state in GATES else "clear"}
+    return (await _step(work, open_new=True))["state"]

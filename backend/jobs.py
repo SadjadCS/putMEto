@@ -86,7 +86,7 @@ class LinkedInSearchBody(BaseModel):
 
 
 async def search_linkedin_regions(keywords: str, regions: list[str], remote_only: bool, limit: int) -> dict:
-    """Search each selected geography without local role or skill filtering."""
+    """Search each selected geography; callers decide which results are relevant."""
     if _linkedin_batch_lock.locked():
         raise SourceError("A LinkedIn search is already running. Wait for it to finish.")
     async with _linkedin_batch_lock:
@@ -162,23 +162,52 @@ def _contains_term(text: str, term: str) -> bool:
     return bool(term.strip()) and re.search(r"(?<!\w)" + re.escape(term.strip().casefold()) + r"(?!\w)", text.casefold()) is not None
 
 
-def score_job(job: dict, state: dict) -> tuple[int, list[str], bool]:
-    """Transparent keyword overlap: a relevance aid, not an AI hiring prediction."""
-    positions = [item["name"] for item in state.get("positions", []) if item.get("confirmed")]
-    skills = [item for item in state.get("skills", []) if item.get("confirmed")]
-    title = str(job.get("title", ""))
-    text = f"{title} {job.get('description', '')}"
+TITLE_FILLER = {"a", "and", "the", "of", "in", "for", "senior", "junior", "sr", "jr", "lead", "principal"}
+
+
+def confirmed_positions(state: dict) -> list[str]:
+    return [item["name"] for item in state.get("positions", []) if item.get("confirmed")]
+
+
+def position_match(title: str, positions: list[str]) -> float:
+    """How much of the closest target position a job title contains, from 0 to 1."""
     title_words = _words(title)
-    ignored = {"a", "and", "the", "of", "in", "for", "senior", "junior", "sr", "jr", "lead", "principal"}
     best = 0.0
     for position in positions:
         if _contains_term(title, position):
-            best = 1.0
-            break
-        words = _words(position) - ignored
+            return 1.0
+        words = _words(position) - TITLE_FILLER
         if words:
-            overlap = len(words & title_words) / len(words)
-            best = max(best, overlap)
+            best = max(best, len(words & title_words) / len(words))
+    return best
+
+
+def _matches_search(title: str, keywords: str) -> bool:
+    """A result belongs to a keyword search when its title shares a meaningful searched word."""
+    return bool((_words(keywords) - TITLE_FILLER - {"or", "not"}) & _words(title))
+
+
+def positions_query(positions: list[str]) -> str:
+    """One LinkedIn keyword search for any target position, within LinkedIn's 300-character limit."""
+    terms = [" ".join(re.sub(r"[()\"]", " ", name).split()) for name in positions]
+    terms = [term for term in terms if term]
+    if len(terms) == 1:
+        return terms[0][:300]
+    query = ""
+    for term in terms:
+        candidate = f"{query} OR ({term})" if query else f"({term})"
+        if len(candidate) > 300:
+            break
+        query = candidate
+    return query
+
+
+def score_job(job: dict, state: dict) -> tuple[int, list[str], bool]:
+    """Transparent keyword overlap: a relevance aid, not an AI hiring prediction."""
+    skills = [item for item in state.get("skills", []) if item.get("confirmed")]
+    title = str(job.get("title", ""))
+    text = f"{title} {job.get('description', '')}"
+    best = position_match(title, confirmed_positions(state))
     from .skills import normalized_name
     skill_text = normalized_name(text)
     matched = [skill["name"] for skill in skills if any(
@@ -304,7 +333,12 @@ def _jsonld_fields(posting: dict) -> dict:
 async def _fetch_source(source: dict) -> list[dict]:
     kind, url = source["kind"], source.get("url", "")
     if kind == "linkedin":
-        result = await search_linkedin_regions("", ["United States", "Europe"], False, 10)
+        state = db.get_state()
+        preferences = state.get("preferences", {})
+        location = str(preferences.get("location", "")).strip()
+        result = await search_linkedin_regions(positions_query(confirmed_positions(state)),
+                                               [location] if location else ["United States", "Europe"],
+                                               bool(preferences.get("remote_only")), 10)
         if result.get("requires_action") or result.get("warnings"):
             # Discovery accepts lists; preserve partial results while surfacing feedback.
             source["_warnings"] = [result["message"], *result.get("warnings", [])]
@@ -372,14 +406,10 @@ async def discover_jobs():
         sources = [source for source in state.get("sources", []) if source.get("enabled")]
         if not sources:
             raise HTTPException(422, "Enable at least one job source first.")
-        has_positions = any(item.get("confirmed") for item in state.get("positions", []))
-        if not has_positions and not any(source["kind"] == "linkedin" for source in sources):
-            raise HTTPException(422, "Confirm at least one target position before discovering jobs, or enable LinkedIn to browse all US and Europe jobs.")
-        warnings, candidates = [], []
+        if not confirmed_positions(state):
+            raise HTTPException(422, "Confirm at least one target position before discovering jobs. To browse LinkedIn without one, use Search LinkedIn.")
+        warnings, candidates, unrelated = [], [], 0
         for source in sources:
-            if source["kind"] != "linkedin" and not has_positions:
-                warnings.append(f"{source['name']}: confirm a target position to search this source.")
-                continue
             try:
                 fields = await _fetch_source(source)
                 warnings.extend(f"{source['name']}: {warning}" for warning in source.pop("_warnings", []))
@@ -388,8 +418,10 @@ async def discover_jobs():
                 for value in fields:
                     try:
                         job = make_job(value, source_name, state)
-                        if source["kind"] == "linkedin" or score_job(job, state)[2]:
+                        if score_job(job, state)[2]:
                             candidates.append(job)
+                        else:
+                            unrelated += 1
                     except (SourceError, ValueError, TypeError):
                         invalid += 1
                 if not fields and source["kind"] == "camoufox":
@@ -414,7 +446,11 @@ async def discover_jobs():
             return count
 
         count = db.mutate_state(persist)
+        from . import job_matching
+        job_matching.kick()
         message = f"Found {count} new matching {'job' if count == 1 else 'jobs'}."
+        if unrelated:
+            message += f" Skipped {unrelated} that {'does' if unrelated == 1 else 'do'} not match your target positions or location."
         if not candidates and not warnings:
             message += " Try broader target positions, a different location, or more sources."
         return {"count": count, "message": message, "warnings": warnings}
@@ -434,13 +470,21 @@ async def search_linkedin_jobs(body: LinkedInSearchBody):
     except SourceError as exc:
         raise HTTPException(503, str(exc)) from exc
     state = db.get_state()
-    candidates, seen = [], set()
+    positions = confirmed_positions(state)
+    candidates, seen, unrelated = [], set(), 0
     warnings = list(result.get("warnings", []))
     for fields in result.get("jobs", [])[:body.limit * len(regions)]:
         try:
             fields = {**fields, "url": canonical_job_url(fields["url"])}
             job = make_job(fields, "LinkedIn", state)
-            if job["url"] not in seen:
+            # LinkedIn pads results with unrelated jobs. Keep a job whose title
+            # matches the searched words or a target position; with neither to
+            # compare against, the search is open browsing and keeps everything.
+            if (body.keywords or positions) and not (
+                _matches_search(job["title"], body.keywords) or position_match(job["title"], positions) >= 0.5
+            ):
+                unrelated += 1
+            elif job["url"] not in seen:
                 candidates.append(job)
                 seen.add(job["url"])
         except (SourceError, ValueError, KeyError, TypeError):
@@ -462,10 +506,15 @@ async def search_linkedin_jobs(body: LinkedInSearchBody):
         return count, saved
 
     count, jobs = db.mutate_state(persist) if body.save else (0, candidates)
+    if body.save:
+        from . import job_matching
+        job_matching.kick()
     message = result.get("message", "LinkedIn search complete.")
     if body.save and candidates:
         message += f" Added {count} new jobs to your workspace; existing jobs were kept."
-    return {"count": count, "found": len(candidates), "jobs": jobs, "requires_action": result.get("requires_action", False), "message": message, "search_url": result.get("search_url", ""), "search_urls": result.get("search_urls", []), "regions": regions, "warnings": warnings}
+    if unrelated:
+        message += f" Skipped {unrelated} {'result' if unrelated == 1 else 'results'} matching neither your keywords nor your target positions."
+    return {"count": count, "found": len(candidates), "skipped": unrelated, "jobs": jobs, "requires_action": result.get("requires_action", False), "message": message, "search_url": result.get("search_url", ""), "search_urls": result.get("search_urls", []), "regions": regions, "warnings": warnings}
 
 
 @router.post("/jobs")
@@ -484,7 +533,10 @@ async def create_job(body: ManualJob):
         state["jobs"].append(job)
         return job
 
-    return db.mutate_state(persist)
+    saved = db.mutate_state(persist)
+    from . import job_matching
+    job_matching.kick()
+    return saved
 
 
 @router.patch("/jobs/{job_id}")

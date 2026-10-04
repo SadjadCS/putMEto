@@ -5,6 +5,7 @@ import json
 from collections import deque
 
 import httpx
+from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 from pypdf import PdfReader
@@ -22,6 +23,10 @@ ITEM = {
     "end": "2024",
     "original": "Built Python APIs and wrote SQL queries.",
 }
+# A CV and the AI's structured reading of it: descriptions are line numbers.
+CV_LINES = ["Ada Applicant", "ada@example.com", "Software engineer, Example Company, 2021 - 2024",
+            "Built Python APIs and wrote SQL queries."]
+EXTRACTED_ITEM = {key: ITEM[key] for key in ("kind", "title", "organization", "start", "end")} | {"description_lines": [4]}
 
 
 @pytest.fixture
@@ -34,13 +39,25 @@ def client(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def model(monkeypatch):
+def ollama_capabilities():
+    """What the mocked Ollama server reports for the model; without "vision" it cannot read PDF pages."""
+    return ["completion", "vision"]
+
+
+@pytest.fixture
+def model(client, monkeypatch, ollama_capabilities):
     """Exercise the AI HTTP/schema layer without permitting real connections."""
+    response = client.put("/api/settings", json={
+        "provider": "ollama", "base_url": "http://127.0.0.1:11434", "model": "llama3.2", "api_key": "",
+    })
+    assert response.status_code == 200, response.text
     responses = deque()
     requests = []
     original_client = httpx.AsyncClient
 
     def handle(request):
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"capabilities": ollama_capabilities})
         requests.append({"url": str(request.url), "body": json.loads(request.content), "headers": dict(request.headers)})
         assert responses, "Unexpected AI/network request: tests must supply every response."
         output = responses.popleft()
@@ -74,30 +91,144 @@ def confirm_item(client, item, **overrides):
     return response.json()
 
 
-def pdf_with_text(text):
+def pdf_with_text(*lines):
     stream = io.BytesIO()
     document = canvas.Canvas(stream)
-    document.drawString(40, 760, text)
+    for index, line in enumerate(lines):
+        document.drawString(40, 760 - 20 * index, line)
     document.save()
     return stream.getvalue()
 
 
-def test_pdf_import_extracts_text_and_requires_review(client, model):
-    responses, requests = model
-    responses.append({
-        "profile": {"name": "Ada Applicant", "email": "ada@example.com"},
-        "items": [{**ITEM, "enhanced": "Built backend APIs with Python and SQL."}],
+def import_cv(client, model, extraction, transcript=CV_LINES, filename="cv.pdf", mime="application/pdf"):
+    """Upload a PDF CV; the mocked AI first reads its pages, then structures what it read."""
+    model[0].extend([{"lines": transcript}, extraction])
+    return client.post("/api/import", files={"file": (filename, pdf_with_text(*transcript), mime)})
+
+
+@pytest.mark.parametrize("kind", ["experience", "project", "education", "publication"])
+def test_pdf_import_reads_the_pages_and_copies_descriptions_from_them(client, model, kind):
+    response = import_cv(client, model, {
+        "profile": {"name": "Ada Applicant", "email": "ada@example.com", "headline": "Invented headline"},
+        "items": [{**EXTRACTED_ITEM, "kind": kind}],
     })
-    response = client.post("/api/import", files={"file": ("cv.pdf", pdf_with_text("Ada Applicant built Python APIs."), "application/pdf")})
     assert response.status_code == 200, response.text
     assert response.json()["count"] == 1
-    sent = json.loads(requests[0]["body"]["messages"][1]["content"])
-    assert "Ada Applicant built Python APIs." in sent["cv_text"]
+    reading, structuring = (request["body"]["messages"][1] for request in model[1])
+    assert len(reading["images"]) == 1 and reading["images"][0].startswith("iVBOR"), "Each page is sent as a PNG image."
+    assert json.loads(reading["content"]) == {"page_count": 1}
+    assert "images" not in structuring
+    assert [line["text"] for line in json.loads(structuring["content"])["cv_lines"]] == CV_LINES
     state = client.get("/api/state").json()
     assert state["profile"]["name"] == "Ada Applicant"
-    assert state["items"][0]["original"] == ITEM["original"]
-    assert state["items"][0]["confirmed"] is False
-    assert "Built backend APIs with Python and SQL." not in client.get("/api/resume").text
+    assert state["profile"]["headline"] == "", "Fields the CV does not contain are never saved."
+    item = state["items"][0]
+    assert {key: item[key] for key in ("kind", "title", "organization", "start", "end")} == {**{key: ITEM[key] for key in ("title", "organization", "start", "end")}, "kind": kind}
+    assert item["original"] == "Built Python APIs and wrote SQL queries."
+    assert item["enhanced"] == ""
+    assert item["confirmed"] is True
+    assert item["original"] in client.get("/api/resume").text
+    exported = client.get("/api/resume.pdf")
+    assert exported.status_code == 200, exported.text
+    document_text = "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(exported.content)).pages)
+    assert item["original"] in document_text
+
+
+def test_description_lines_are_copied_in_cv_order_from_the_transcript(client, model):
+    transcript = ["Ada Applicant", "Software engineer, Example Company, 2021 - 2024", "Built Python APIs and wrote SQL queries.",
+                  "Designed the reporting service."]
+    model[0].append({"lines": [transcript[0], "  " + transcript[1], *transcript[2:], ""]})
+    model[0].append({"profile": {"name": "Ada Applicant"}, "items": [{**EXTRACTED_ITEM, "description_lines": [4, 3, 3, 99]}]})
+    response = client.post("/api/import", files={"file": ("cv.pdf", pdf_with_text("Ada Applicant"), "application/pdf")})
+    assert response.status_code == 200, response.text
+    structuring = model[1][1]["body"]["messages"][1]
+    assert [line["text"] for line in json.loads(structuring["content"])["cv_lines"]] == transcript
+    item = client.get("/api/state").json()["items"][0]
+    assert item["original"] == "Built Python APIs and wrote SQL queries.\nDesigned the reporting service."
+
+
+def test_scanned_pdf_is_read_like_any_other_page(client, model):
+    document = io.BytesIO()
+    page = canvas.Canvas(document)
+    page.rect(40, 700, 200, 60, fill=1)  # Visible content without any text layer, like a scan.
+    page.save()
+    model[0].extend([{"lines": CV_LINES}, {"profile": {"name": "Ada Applicant"}, "items": [EXTRACTED_ITEM]}])
+    response = client.post("/api/import", files={"file": ("scan.pdf", document.getvalue(), "application/pdf")})
+    assert response.status_code == 200, response.text
+    assert db.get_state()["items"][0]["original"] == "Built Python APIs and wrote SQL queries."
+
+
+def test_model_that_cannot_read_images_gets_an_actionable_error(client, model, ollama_capabilities):
+    ollama_capabilities.remove("vision")
+    response = client.post("/api/import", files={"file": ("cv.pdf", pdf_with_text(*CV_LINES), "application/pdf")})
+    assert response.status_code == 422
+    assert "cannot read PDF pages" in response.json()["detail"]
+    assert not model[1], "No CV content is sent to a model that cannot read it."
+    assert not db.get_state()["items"]
+
+
+@pytest.mark.parametrize("filename,content,mime", [
+    ("cv.docx", b"PK\x03\x04synthetic Word file", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("cv.txt", b"Ada Applicant built Python APIs and SQL queries.", "text/plain"),
+])
+def test_only_pdf_cvs_are_accepted(client, model, filename, content, mime):
+    response = client.post("/api/import", files={"file": (filename, content, mime)})
+    assert response.status_code == 415
+    assert "as a PDF" in response.json()["detail"]
+    assert not model[1]
+
+
+def test_reimporting_a_cv_refreshes_its_entries_instead_of_duplicating_them(client, model):
+    manual = create_item(client, model, title="Volunteer mentor", organization="Code Club", original="Mentored students.")
+    extraction = {"profile": {"name": "Ada Applicant"}, "items": [EXTRACTED_ITEM]}
+    assert import_cv(client, model, extraction).status_code == 200
+    imported = next(item for item in db.get_state()["items"] if item["title"] == ITEM["title"])
+    db.mutate_state(lambda state: next(item for item in state["items"] if item["id"] == imported["id"]).update(enhanced="An AI rewording."))
+
+    updated_cv = [*CV_LINES, "Led the migration to PostgreSQL."]
+    response = import_cv(client, model, {**extraction, "items": [
+        {**EXTRACTED_ITEM, "description_lines": [4, 5]},
+        {"kind": "project", "title": "Led the migration to PostgreSQL.", "description_lines": []},
+    ]}, transcript=updated_cv)
+    assert response.status_code == 200, response.text
+    assert (response.json()["added"], response.json()["updated"]) == (1, 1)
+    items = db.get_state()["items"]
+    assert [item["title"] for item in items] == ["Volunteer mentor", ITEM["title"], "Led the migration to PostgreSQL."]
+    refreshed = items[1]
+    assert refreshed["id"] == imported["id"]
+    assert refreshed["original"] == "Built Python APIs and wrote SQL queries.\nLed the migration to PostgreSQL."
+    assert refreshed["enhanced"] == "" and refreshed["confirmed"] is True
+    assert items[0] == {key: value for key, value in manual.items() if key != "warning"}
+    assert items[2]["original"] == ""
+
+
+def test_entries_can_be_saved_without_a_description_and_without_an_ai_call(client, model):
+    response = client.post("/api/items", json={**ITEM, "original": ""})
+    assert response.status_code == 201, response.text
+    item = response.json()
+    assert item["original"] == item["enhanced"] == ""
+    confirmed = confirm_item(client, item, title="Senior software engineer")
+    assert confirmed["enhanced"] == "" and confirmed["confirmed"] is False
+    assert client.post(f'/api/items/{item["id"]}/enhance').status_code == 400
+    assert not model[1]
+
+
+def test_imported_entry_can_be_edited_or_excluded_without_another_ai_call(client, model):
+    imported = import_cv(client, model, {"profile": {"name": "Ada Applicant"}, "items": [EXTRACTED_ITEM]})
+    assert imported.status_code == 200, imported.text
+    item = client.get("/api/state").json()["items"][0]
+    assert item["confirmed"] is True
+    assert item["original"] in client.get("/api/resume").text
+    edited = confirm_item(client, item, enhanced="Maintained the Python API for internal reports.")
+    assert edited["confirmed"] is True
+    preview = client.get("/api/resume").text
+    assert edited["enhanced"] in preview
+    assert item["original"] not in preview
+
+    excluded = confirm_item(client, edited, confirmed=False)
+    assert excluded["confirmed"] is False
+    assert edited["enhanced"] not in client.get("/api/resume").text
+    assert len(model[1]) == 2, "Only the import itself used the AI: reading the pages, then structuring them."
 
 
 @pytest.mark.parametrize("filename,mime", [
@@ -107,12 +238,10 @@ def test_pdf_import_extracts_text_and_requires_review(client, model):
     ("Resume.txt", "text/plain"),
 ])
 def test_pdf_contents_are_detected_independently_of_browser_filename(client, model, filename, mime):
-    responses, requests = model
-    responses.append({"profile": {}, "items": [{**ITEM, "enhanced": "Developed Python APIs and SQL queries."}]})
-    response = client.post("/api/import", files={"file": (filename, pdf_with_text("Example Applicant built Python APIs and SQL queries."), mime)})
+    response = import_cv(client, model, {"profile": {}, "items": [EXTRACTED_ITEM]}, filename=filename, mime=mime)
     assert response.status_code == 200, response.text
     assert response.json()["count"] == 1
-    assert len(requests) == 1
+    assert len(model[1]) == 2
     assert len(client.get("/api/state").json()["items"]) == 1
 
 
@@ -135,9 +264,10 @@ def test_import_ai_timeout_stops_extraction_and_keeps_workspace(client, monkeypa
         finally:
             cancelled.append(True)
     monkeypatch.setattr(main, "IMPORT_AI_TIMEOUT", 0.01)
-    monkeypatch.setattr(main.ai, "extract_resume", wait_forever)
+    monkeypatch.setattr(main.ai, "strongest", AsyncMock(side_effect=lambda settings: (settings, None)))
+    monkeypatch.setattr(main.ai, "transcribe_pdf", wait_forever)
     before = client.get("/api/state").json()
-    response = client.post("/api/import", files={"file": ("cv.txt", b"Example Applicant built Python APIs and SQL queries.", "text/plain")})
+    response = client.post("/api/import", files={"file": ("cv.pdf", pdf_with_text(*CV_LINES), "application/pdf")})
     assert response.status_code == 503
     assert "timed out" in response.json()["detail"]
     assert cancelled == [True]
@@ -160,11 +290,10 @@ def test_blank_pdf_does_not_send_empty_text_to_ai(client, model):
     assert not db.get_state()["items"]
 
 
-@pytest.mark.parametrize("output", ["this is not JSON", {"profile": {}, "items": [{"kind": "experience", "title": "Bad"}]}])
+@pytest.mark.parametrize("output", ["this is not JSON", {"profile": {}, "items": [{"kind": "experience", "description_lines": [1]}]}])
 def test_malformed_ai_import_does_not_partially_save(client, model, output):
-    model[0].append(output)
     before = db.get_state()
-    response = client.post("/api/import", files={"file": ("cv.txt", b"Ada Applicant built Python APIs.", "text/plain")})
+    response = import_cv(client, model, output)
     assert response.status_code >= 400
     assert "invalid response" in response.json()["detail"].lower()
     assert db.get_state() == before
@@ -337,7 +466,7 @@ def test_profile_edit_invalidates_a_prepared_resume(client, model):
     assert client.get("/api/jobs/job-one/resume.pdf").status_code == 400
 
 
-def test_full_review_to_application_confirmation_workflow(client, model, monkeypatch):
+def test_import_to_application_confirmation_workflow(client, model, monkeypatch):
     from backend import jobs
     from backend.network import validate_url_shape
 
@@ -348,22 +477,22 @@ def test_full_review_to_application_confirmation_workflow(client, model, monkeyp
         assert url == "https://jobs.example.com/python"
         assert profile["name"] == "Ada Applicant"
         text = "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(pdf)).pages)
-        assert "Built backend APIs with Python and SQL." in text
+        assert "Built Python APIs and wrote SQL queries." in text
         return {"filled_fields": 2, "resume_attached": True}
 
     monkeypatch.setattr(jobs, "validate_public_url", public_url_without_dns)
     monkeypatch.setattr(jobs, "start_application", application_browser)
-    model[0].append({"profile": {"name": "Ada Applicant"}, "items": [{**ITEM, "enhanced": "Built backend APIs with Python and SQL."}]})
-    imported = client.post("/api/import", files={"file": ("cv.txt", b"Ada Applicant built backend APIs with Python and SQL.", "text/plain")})
+    imported = import_cv(client, model, {"profile": {"name": "Ada Applicant"}, "items": [EXTRACTED_ITEM]})
     assert imported.status_code == 200
-    item = confirm_item(client, client.get("/api/state").json()["items"][0])
-    model[0].append({"skills": [{"name": "Python", "evidence": "Built backend APIs with Python and SQL.", "rationale": "A language used in the confirmed experience."}]})
+    item = client.get("/api/state").json()["items"][0]
+    assert item["confirmed"] is True
+    model[0].append({"skills": [{"name": "Python", "evidence": "Built Python APIs and wrote SQL queries.", "rationale": "A language used in the confirmed experience."}]})
     assert client.post("/api/suggestions/skills").status_code == 200
     skills = client.get("/api/state").json()["skills"]
     skills[0]["confirmed"] = True
     assert client.put("/api/skills", json={"items": skills}).status_code == 200
     assert client.put("/api/preferences", json={"track": "industry", "location": "", "remote_only": True}).status_code == 200
-    model[0].append({"names": ["Software engineer"]})
+    model[0].append({"roles": [{"title": "Software engineer", "family": "Engineering", "fit": "strong", "reason": "Built backend APIs."}]})
     assert client.post("/api/suggestions/positions").status_code == 200
     positions = client.get("/api/state").json()["positions"]
     positions[0]["confirmed"] = True

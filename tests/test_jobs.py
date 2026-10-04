@@ -61,7 +61,7 @@ def test_discovery_isolates_failure_deduplicates_and_preserves_status(workspace,
     assert db.get_state()["jobs"][0]["status"] == "saved"
 
 
-def test_discovery_requires_confirmed_positions(workspace):
+def test_discovery_requiresconfirmed_positions(workspace):
     db.mutate_state(lambda state: state.update(positions=[{"name": "Engineer", "confirmed": False}]))
     assert workspace.post("/api/jobs/discover").status_code == 422
 

@@ -115,3 +115,40 @@ def test_cancelled_generation_interrupts_and_releases_thread(monkeypatch):
         assert not db.get_state()["items"]
 
     asyncio.run(exercise())
+
+
+def test_pdf_pages_reach_codex_as_full_resolution_images(monkeypatch):
+    async def exercise():
+        bridge, calls, timeouts = CodexBridge(), [], []
+        original_wait_for = asyncio.wait_for
+
+        async def account():
+            pass
+
+        async def rpc(method, params, **kwargs):
+            calls.append((method, params))
+            if method == "thread/start":
+                return {"thread": {"id": "reading"}}
+            if method == "turn/start":
+                bridge._notification("item/completed", {
+                    "threadId": "reading", "item": {"type": "agentMessage", "id": "answer", "text": '{"lines":[]}'},
+                })
+                bridge._notification("turn/completed", {"threadId": "reading", "turn": {"status": "completed"}})
+                return {"turn": {"id": "turn"}}
+            return {}
+
+        async def record_timeout(awaitable, timeout):
+            timeouts.append(timeout)
+            return await original_wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(bridge, "_require_account", account)
+        monkeypatch.setattr(bridge, "_rpc", rpc)
+        monkeypatch.setattr(asyncio, "wait_for", record_timeout)
+        await bridge.generate_json("Transcribe.", {"page_count": 2}, {"type": "object", "properties": {}}, images=[b"one", b"two"])
+        text, *pictures = next(params for method, params in calls if method == "turn/start")["input"]
+        assert text["type"] == "text" and '"page_count": 2' in text["text"]
+        assert pictures == [{"type": "image", "url": "data:image/png;base64,b25l", "detail": "original"},
+                            {"type": "image", "url": "data:image/png;base64,dHdv", "detail": "original"}]
+        assert timeouts == [360]
+
+    asyncio.run(exercise())

@@ -1,0 +1,6 @@
+pyobjc-framework-Cocoa>=10.3
+pyobjc-framework-Quartz>=10.3
+pyobjc-framework-ScreenCaptureKit>=10.3
+pyobjc-framework-AVFoundation>=10.3
+pyobjc-framework-CoreMedia>=10.3
+pyobjc-framework-libdispatch>=10.3
